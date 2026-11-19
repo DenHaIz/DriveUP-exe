@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -203,7 +203,7 @@ namespace DriveUp
             hags.NeedsReboot = true;
             hags.OnWhenAbsent = () => seen != null && seen.HagsEnabled;
             var windowed = Add(new WindowedGames(), "windowed", TuneCat.Gaming, "\uE737", () => L.T("Оптимизация оконных игр", "Optimizations for windowed games"));
-            var mouse = Add(new MouseAcceleration(), "mouse", TuneCat.Gaming, "\uE962", () => L.T("Повышенная точность указателя", "Enhance pointer precision"));
+            var mouse = Add(new MouseAcceleration { PerUser = true }, "mouse", TuneCat.Gaming, "\uE962", () => L.T("Повышенная точность указателя", "Enhance pointer precision"));
 
             // ----- interface -----
             var anim = Add(new Animations(), "animations", TuneCat.Interface, "\uE7C4", () => L.T("Анимации окон и панели задач", "Window and taskbar animations"));
@@ -231,7 +231,12 @@ namespace DriveUp
                     @"\Microsoft\Windows\Feedback\Siuf\DmClient",
                     @"\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload",
                     @"\Microsoft\Office\OfficeTelemetryAgentLogOn2016",
-                    @"\Microsoft\Office\OfficeTelemetryAgentFallBack2016"),
+                    @"\Microsoft\Office\OfficeTelemetryAgentFallBack2016")
+            {
+                // Windows Update uses the Appraiser's data to offer feature updates (24H2 → 25H2 → 26H2) and to hold
+                // them back from PCs they would break: left on since 1.7 (ProgramDataUpdater is gone in Windows 11).
+                Kept = new[] { @"\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser" },
+            },
                 "telemetrytasks", TuneCat.Tasks, "\uE9F9", () => L.T("Задачи сбора данных", "Data collection tasks"));
 
             // ----- ads and suggestions -----
@@ -254,14 +259,15 @@ namespace DriveUp
             var fast = Add(new RegSwitch(true, @"SYSTEM\CurrentControlSet\Control\Session Manager\Power", "HiberbootEnabled", 1, 0)
             {
                 OnWhenAbsent = () => true, OnText = () => L.T("включён", "on"), OffText = () => L.T("выключен", "off"),
-                When = m => Reg.Dword(true, @"SYSTEM\CurrentControlSet\Control\Power", "HibernateEnabled") != 0,
+                When = m => Hibernation.IsOn(),
             }, "faststartup", TuneCat.System, "\uE7E8", () => L.T("Быстрый запуск", "Fast startup"));
             const string HvciPolicy = @"SOFTWARE\Policies\Microsoft\Windows\DeviceGuard";
             const string Hvci = @"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity";
             var integrity = Add(new RegSwitch(true, Hvci, "Enabled", 1, 0)
             {
                 // Only where it is on now and not set by the organisation (policy, or locked by UEFI).
-                When = m => !m.Managed && !m.SecureBiometrics && Reg.Dword(true, Hvci, "Enabled") == 1 && Reg.Dword(true, Hvci, "Locked") != 1 &&
+                // Recall keeps its snapshots in a VBS enclave: not without it either.
+                When = m => !m.Managed && !m.SecureBiometrics && !m.Recall && Reg.Dword(true, Hvci, "Enabled") == 1 && Reg.Dword(true, Hvci, "Locked") != 1 &&
                             Reg.Get(true, HvciPolicy, "HypervisorEnforcedCodeIntegrity") == null,
             }, "hvci", TuneCat.System, "\uE72E", () => L.T("Целостность памяти", "Memory integrity"));
             integrity.NeedsReboot = true;
@@ -271,11 +277,25 @@ namespace DriveUp
 
             // ----- background processes: Windows features and Store apps that run when nobody asked -----
             var widgets = Add(new RegSwitch(true, @"SOFTWARE\Policies\Microsoft\Dsh", "AllowNewsAndInterests", 1, 0)
-            { OnWhenAbsent = () => true, When = m => m.Windows11, ViaPolicy = true, OnText = () => L.T("включены", "on"), OffText = () => L.T("выключены", "off") },
+            { OnWhenAbsent = () => true, When = m => m.Windows11 && LocalPolicy.Available, ViaPolicy = true, OnText = () => L.T("включены", "on"), OffText = () => L.T("выключены", "off") },
                 "widgets", TuneCat.Background, "\uE8A1", () => L.T("Виджеты (погода, новости, лента)", "Widgets (weather, news, feed)"));
             widgets.NeedsReboot = true;
             widgets.Processes = new[] { "Widgets", "WidgetService" };
             extras.Add(new Extra { Tweak = widgets, Value = "0", Level = 1, Reason = () => L.T("Лента новостей держит несколько процессов браузерного движка", "The news feed keeps several browser engine processes") });
+            // Home editions have no Group Policy, and Windows lets no other program write that policy (it failed
+            // with an error there): the widgets go with their package instead, which "Return" or the Store bring back.
+            var widgetsApp = new StoreApp("MicrosoftWindows.Client.WebExperience_", "")
+            {
+                Category = TuneCat.Background, Glyph = widgets.Glyph, Processes = widgets.Processes,
+                Name = () => L.T("Виджеты (погода, новости, лента)", "Widgets (weather, news, feed)"),
+            };
+            Catalog.Add(widgetsApp);
+            extras.Add(new Extra
+            {
+                Tweak = widgetsApp, Value = "0", Level = 1, When = m => m.Windows11 && !LocalPolicy.Available,
+                Reason = () => L.T("Лента новостей держит несколько процессов браузерного движка", "The news feed keeps several browser engine processes"),
+                Warn = () => L.T("пропадут и виджеты на экране блокировки", "lock screen widgets go too"),
+            });
             var feeds = Add(new RegSwitch(true, @"SOFTWARE\Policies\Microsoft\Windows\Windows Feeds", "EnableFeeds", 1, 0)
             { OnWhenAbsent = () => true, When = m => !m.Windows11, OnText = () => L.T("включены", "on"), OffText = () => L.T("выключены", "off") },
                 "newsfeed", TuneCat.Background, "\uE8A1", () => L.T("Новости и интересы на панели задач", "News and interests on the taskbar"));
@@ -335,7 +355,7 @@ namespace DriveUp
             Background("TelegramMessengerLLP.TelegramDesktop_t4vj0pshhgkwm", 3, "Telegram", "Telegram", () => L.T("Мессенджер держит соединение в фоне", "The messenger keeps a connection in the background"),
                 () => L.T("сообщения придут, только пока Telegram открыт", "messages arrive only while Telegram is open"), "Telegram");
             Background("MSTeams_8wekyb3d8bbwe", 3, "Microsoft Teams", "Microsoft Teams", () => L.T("Держит соединение и процессы браузерного движка в фоне", "Keeps a connection and browser engine processes in the background"),
-                () => L.T("звонки и сообщения придут, только пока Teams открыт", "calls and messages arrive only while Teams is open"), "ms-teams", "msedgewebview2");
+                () => L.T("звонки и сообщения придут, только пока Teams открыт", "calls and messages arrive only while Teams is open"), "ms-teams");
             ExtraService("WMPNetworkSvc", "disabled", 1, () => L.T("Сетевой доступ Windows Media Player", "Windows Media Player network sharing"),
                 () => L.T("Раздача медиатеки по сети, почти никому не нужна", "Shares the media library on the network; hardly anyone needs it"));
             ExtraService("ESRV_SVC_QUEENCREEK", "disabled", 1, () => L.T("Intel: программа улучшения (телеметрия)", "Intel computing improvement (telemetry)"),
@@ -408,7 +428,7 @@ namespace DriveUp
                     .Add(false, @"Software\Microsoft\Windows\CurrentVersion\GameDVR", "AppCaptureEnabled", 0)
                     .Add(false, @"System\GameConfigStore", "GameDVR_Enabled", 0),
                 "gamecapture", TuneCat.Gaming, "\uE722", () => L.T("Запись и скриншоты Game Bar", "Game Bar captures"));
-            var menu = Add(new MenuDelay(), "menudelay", TuneCat.Interface, "\uE700", () => L.T("Задержка открытия меню", "Menu show delay"));
+            var menu = Add(new MenuDelay { PerUser = true }, "menudelay", TuneCat.Interface, "\uE700", () => L.T("Задержка открытия меню", "Menu show delay"));
             var delay = Add(new RegSwitch(false, @"Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize", "StartupDelayInMSec", 0, 10000)
             { OnText = () => L.T("без паузы", "no pause"), OffText = () => L.T("с паузой ~10 с", "~10 s pause") },
                 "startupdelay", TuneCat.Startup, "\uE916", () => L.T("Пауза перед автозагрузкой", "Startup apps delay"));
@@ -468,7 +488,7 @@ namespace DriveUp
                 "bgpolicy", TuneCat.Background, "\uE71D", () => L.T("Фоновая работа приложений из Store", "Background activity of Store apps"));
             bgPolicy.NeedsReboot = true;
             if (DesktopUser.Other) menu.NeedsReboot = mouse.NeedsReboot = true;
-            var hotkeys = Add(new AccessHotkeys(), "hotkeys", TuneCat.Gaming, "\uE765", () => L.T("Сочетания залипания и фильтрации клавиш", "Sticky and Filter Keys shortcuts"));
+            var hotkeys = Add(new AccessHotkeys { PerUser = true }, "hotkeys", TuneCat.Gaming, "\uE765", () => L.T("Сочетания залипания и фильтрации клавиш", "Sticky and Filter Keys shortcuts"));
             var separate = Add(new RegSwitch(false, Adv, "SeparateProcess", 1, 0), "separateproc", TuneCat.Interface, "\uE838", () => L.T("Окна папок в отдельном процессе", "Folder windows in a separate process"));
             separate.NeedsReboot = true;
             var startAds = Add(new RegSet { When = m => m.Windows11 }
@@ -520,6 +540,8 @@ namespace DriveUp
                 new[] { "PandoraMediaInc.29680B314EFC2_", "Pandora" }, new[] { "CAF9E577.Plex_", "Plex" }, new[] { "ActiproSoftwareLLC.562882FEEB491_", "Code Writer" },
                 new[] { "46928bounde.EclipseManager_", "Eclipse Manager" }, new[] { "AD2F1837.HPJumpStarts_", "HP JumpStart" }, new[] { "DellInc.DellDigitalDelivery_", "Dell Digital Delivery" },
                 new[] { "Amazon.com.Amazon_", "Amazon" },
+                // 1.7: Microsoft stopped Mail and Calendar at the end of 2024 — it no longer syncs.
+                new[] { "microsoft.windowscommunicationsapps_", "Mail and Calendar" },
             })
             {
                 var app = new StoreApp(a[0], a[1]);
@@ -542,7 +564,7 @@ namespace DriveUp
                     Step(tailored, "0", () => L.T("Без подбора советов и рекламы по данным диагностики", "No tips and ads picked from diagnostic data")),
                     Opt(recall, "1", () => L.T("Recall не делает снимки экрана в фоне — меньше нагрузки на диск и процессор", "Recall takes no screen snapshots in the background — less disk and processor load"),
                         () => L.T("поиск по истории экрана Recall не будет работать", "Recall's screen history search stops working")),
-                    Opt(autoDrivers, "0", () => L.T("Windows не заменит сама драйвер, который вы поставили", "Windows will not replace a driver you installed"),
+                    Opt(autoDrivers, "0", () => L.T("Windows не скачивает драйвер сама, когда подключается новое устройство", "Windows does not download a driver by itself when a new device is plugged in"),
                         () => L.T("для нового устройства драйвер ставьте через DriveUP", "install drivers for new devices with DriveUP")),
                 };
                 // The same in every mode, so switching modes never brings them back.
@@ -554,11 +576,17 @@ namespace DriveUp
                 if (!m.Managed)
                     s.AddRange(new[]
                     {
-                        Step(wer, "1", () => L.T("После сбоев программ Windows не собирает и не отправляет отчёты — меньше нагрузки на диск", "After crashes Windows does not collect and send reports — less disk load")),
+                        // Reports are made only after a crash: no load otherwise, and they are what finds a faulty driver.
+                        Opt(wer, "1", () => L.T("После сбоев программ Windows не собирает и не отправляет отчёты", "After crashes Windows does not collect and send reports"),
+                            () => L.T("в обычной работе это не ускоряет ничего, а причину сбоя драйвера будет найти труднее", "speeds nothing up in normal use, and a faulty driver gets harder to track down")),
                         Step(diag, "disabled", () => L.T("Постоянно собирает и отправляет данные: лишняя нагрузка на диск и сеть", "Keeps collecting and sending data: extra disk and network load")),
                         Step(wap, "disabled", () => L.T("Нужна только компьютерам, которыми управляет организация (Intune)", "Only needed on PCs an organisation manages (Intune)")),
                         Step(tasks, "0", () => L.T("Совместимость и сбор данных: периодически грузят процессор и диск на минуты", "Compatibility and data collection: now and then load the processor and disk for minutes")),
-                        Step(doPeers, "0", () => L.T("Windows не раздаёт скачанные обновления другим компьютерам — сеть и диск не заняты в фоне", "Windows does not upload updates to other PCs — network and disk stay free")),
+                        // Windows already shares only within the local network: hardly any gain, and several PCs at home
+                        // then each download every update from the internet.
+                        Opt(doPeers, "0", () => L.T("Windows не раздаёт скачанные обновления другим компьютерам в вашей сети", "Windows does not share downloaded updates with other PCs on your network"),
+                            () => L.T("каждый компьютер дома будет качать обновления из интернета сам; в Параметрах появится «управляется организацией»",
+                                      "every PC at home downloads updates from the internet itself; Settings will say \"managed by your organisation\"")),
                     });
                 return s;
             };
@@ -599,19 +627,26 @@ namespace DriveUp
                                 () => L.T("батарея сядет быстрее", "the battery drains faster"))
                             : powerStep(m, "perf", () => L.T("Частоты не сбрасываются посреди игры", "Clocks stay up mid-game")),
                         Step(boost, pw("2"), () => L.T("Процессор разгоняется сразу и до предела", "The processor boosts right away and all the way") + onMains()),
-                        Step(minState, pw("100"), () => L.T("Без падения частоты между кадрами — меньше микрофризов", "No clock drops between frames — fewer micro-stutters") + onMains()),
+                        // Laptops: processor and graphics share one power budget (Dynamic Boost, SmartShift) — a processor held
+                        // at full clocks takes watts from the graphics card and runs the fans harder, so those stay as they are.
                         // Ryzen 9 X3D: AMD's driver parks the die without the extra cache during games — leave parking to it.
-                        m.DualCcdX3D ? null : Step(cores, pw("100"), () => L.T("Все ядра всегда наготове, без задержки на пробуждение", "All cores always ready, no wake-up delay") + onMains()),
-                        Step(epp, pw("0"), () => L.T("Процессор выбирает скорость, а не экономию", "The processor favours speed over saving") + onMains()),
+                        m.Mobile || m.DualCcdX3D ? null : Step(minState, pw("100"), () => L.T("Без падения частоты между кадрами — меньше микрофризов", "No clock drops between frames — fewer micro-stutters")),
+                        m.Mobile || m.DualCcdX3D ? null : Step(cores, pw("100"), () => L.T("Все ядра всегда наготове, без задержки на пробуждение", "All cores always ready, no wake-up delay")),
+                        m.Mobile
+                            ? Opt(epp, pw("0"), () => L.T("Процессор выбирает скорость, а не экономию", "The processor favours speed over saving") + onMains(),
+                                () => L.T("на игровом ноутбуке процессор может забрать часть мощности у видеокарты — громче вентиляторы", "on a gaming laptop the processor may take power from the graphics card — louder fans"))
+                            : m.DualCcdX3D ? null : Step(epp, pw("0"), () => L.T("Процессор выбирает скорость, а не экономию", "The processor favours speed over saving")),
                         // Laptops: link power and USB suspend stay as the maker set them (see Work and Quiet).
-                        m.Mobile ? null : Step(aspm, pw("0"), () => L.T("Видеокарта и NVMe не ждут выхода линии PCIe из сна", "Graphics card and NVMe skip PCIe link wake-up delays")),
+                        m.Mobile ? null : Opt(aspm, pw("0"), () => L.T("Видеокарта и NVMe не ждут выхода линии PCIe из сна", "Graphics card and NVMe skip PCIe link wake-up delays"),
+                            () => L.T("на кадры почти не влияет, а простой обходится дороже по энергии", "hardly changes frame rates and costs more power at idle")),
                         m.Mobile ? null : Step(usb, pw("0"), () => L.T("Мышь и гарнитура не засыпают — без пропусков ввода", "Mouse and headset never doze — no missed input")),
                         Step(gameMode, "1", () => L.T("Приоритет игре, обновления не ставятся во время игры", "Games get priority, no updates while playing")),
                         Step(record, "0", () => L.T("Постоянная запись видео в фоне отнимает кадры", "Recording video all the time costs frames")),
                         m.Laptop
                             ? Opt(hags, "1", () => L.T("Меньше задержка кадра, но на ноутбуках с двумя видеокартами бывает нестабильно", "Lower frame latency, but can be unstable on laptops with two graphics cards"),
                                 () => L.T("проверьте игры после перезагрузки", "check your games after a restart"))
-                            : Opt(hags, "1", () => L.T("Меньше задержка кадра — видеокарта это поддерживает", "Lower frame latency — the graphics card supports it"),
+                            : Opt(hags, "1", () => L.T("Нужно для генерации кадров DLSS / FSR и чуть снижает задержку — видеокарта это поддерживает",
+                                                       "Needed for DLSS / FSR frame generation and trims latency a little — the graphics card supports it"),
                                 () => L.T("со старыми драйверами бывают сбои", "old drivers may misbehave")),
                         Step(vrr, "1", () => L.T("Плавнее в играх без своей поддержки G-Sync / FreeSync (если монитор умеет VRR)", "Smoother in games without their own G-Sync / FreeSync support (on a VRR monitor)")),
                         Opt(capture, "1", () => L.T("Game Bar не держит запись наготове", "Game Bar keeps no recording ready"),
@@ -619,9 +654,12 @@ namespace DriveUp
                         Step(windowed, "1", () => L.T("Меньше задержка в играх в окне и без рамки", "Lower latency in windowed and borderless games")),
                         Step(mouse, "0", () => L.T("Прицел движется ровно как рука", "Aim moves exactly as your hand does")),
                         Step(hotkeys, "0", () => L.T("Пять нажатий Shift не свернут игру окном «Залипание клавиш»", "Pressing Shift five times will not pull you out of the game with a Sticky Keys prompt")),
-                        Step(anim, "0", () => L.T("Окна и меню открываются мгновенно", "Windows and menus open instantly")),
+                        // Interface effects cost no frames in games: offered for snappier windows, not ticked.
+                        Opt(anim, "0", () => L.T("Окна и меню открываются мгновенно", "Windows and menus open instantly"),
+                            () => L.T("на кадры в играх не влияет — только по вкусу", "does not change frame rates — a matter of taste")),
                         Step(menu, "100", () => L.T("Подменю открываются без паузы", "Submenus open without a pause")),
-                        Step(glass, "0", () => L.T("Меньше работы видеокарте в интерфейсе", "Less work for the graphics card in the interface")),
+                        Opt(glass, "0", () => L.T("Меньше работы видеокарте в интерфейсе", "Less work for the graphics card in the interface"),
+                            () => L.T("на кадры в играх не влияет — только по вкусу", "does not change frame rates — a matter of taste")),
                         linksStep(m),
                         Opt(search, "disabled", () => m.SystemDisk == "HDD"
                                 ? L.T("Индексирование нагружает жёсткий диск", "Indexing keeps the hard disk busy")
@@ -632,19 +670,21 @@ namespace DriveUp
                         new TuneStep
                         {
                             Tweak = integrity, Value = "0", Optional = true,
-                            Reason = () => L.T("Совет Microsoft для игр: +5–10 % кадров", "Microsoft's gaming tip: 5–10 % more frames"),
-                            Warn = () => L.T("слабее защита; некоторые античиты её требуют", "weaker protection; some anti-cheats need it"),
+                            Reason = () => L.T("Microsoft допускает это ради производительности в играх; прирост зависит от игры и процессора",
+                                               "Microsoft allows it for gaming performance; the gain depends on the game and processor"),
+                            Warn = () => L.T("слабее защита ядра; Vanguard (Valorant, LoL), FACEIT и другие античиты без неё могут не запуститься",
+                                             "weaker kernel protection; Vanguard (Valorant, LoL), FACEIT and other anti-cheats may refuse to start without it"),
                         },
                         Step(hours, "8-23", () => L.T("Windows не перезагрузится для обновлений с 8 до 23 — в игровое время", "Windows will not restart for updates between 8:00 and 23:00 — while you play")),
                     };
                     if (m.AnyHdd) s.Add(Step(disk, pw("0"), () => L.T("Диск не останавливается — без подвисаний при загрузке", "The disk never stops — no hitches while loading")));
-                    // Desktops: background programs (voice chat, streaming) are not slowed down to save power.
-                    if (!m.Mobile) s.Add(Step(throttle, "1", () => L.T("Фоновые программы (голосовой чат, стрим) не замедляются ради экономии", "Background programs (voice chat, streaming) are not slowed to save power")));
+                    // Power throttling (EcoQoS) stays on: off, background work is no longer sent to the efficiency cores of
+                    // hybrid processors and competes with the game for the fast ones. SysMain stays too: on an SSD switching
+                    // it off gains nothing measurable and it also looks after memory compression.
+                    // (Before 1.7 Games switched it off on desktops: shown as a change where that is still so.)
+                    if (!m.Mobile) s.Add(Step(throttle, "0", () => L.T("Фоновые программы уходят на энергоэффективные ядра и не мешают игре", "Background programs move to the efficiency cores and leave the game alone")));
                     if (!m.Mobile) s.Add(HibernationStep(hiber));
                     if (m.SystemSsd) s.Add(Step(delay, "1", () => L.T("Программы автозагрузки стартуют сразу, без искусственной паузы", "Startup programs start at once, without the built-in pause")));
-                    // SysMain also runs memory compression: keep it where memory is tight or the drive is slow.
-                    if (m.SystemSsd && m.RamGb >= 15.5)
-                        s.Add(Step(sysMain, "disabled", () => L.T("На SSD и ", "On an SSD with ") + Math.Round(m.RamGb) + L.T(" ГБ памяти предзагрузка почти не нужна", " GB of memory preloading is hardly needed")));
                     s.Add(Opt(pause, "1", () => L.T("Неделю без скачивания и установки обновлений в фоне", "A week without updates downloading and installing in the background"),
                         () => L.T("обновления безопасности тоже подождут", "security updates wait too")));
                     s.AddRange(common(m));
@@ -702,8 +742,12 @@ namespace DriveUp
                         powerStep(m, "saver", () => m.Mobile
                             ? L.T("Режим питания «Лучшая энергоэффективность» — как в Параметрах Windows", "\"Best power efficiency\" power mode — as in Windows Settings")
                             : L.T("Меньше нагрев — вентиляторы медленнее", "Less heat — fans spin slower")),
-                        Step(boost, m.Mobile ? "0,*" : "0,0", () => L.T("Без разгона: заметно холоднее и тише, тяжёлые задачи медленнее", "No boost: noticeably cooler and quieter, heavy tasks slower") +
-                            (m.Mobile ? L.T(" (от сети; от батареи решает Windows)", " (on mains; on battery Windows decides)") : "")),
+                        // Desktops: no boost means base clocks only, a big slowdown — offered, not ticked.
+                        m.Mobile
+                            ? Step(boost, "0,*", () => L.T("Без разгона: заметно холоднее и тише, тяжёлые задачи медленнее", "No boost: noticeably cooler and quieter, heavy tasks slower") +
+                                L.T(" (от сети; от батареи решает Windows)", " (on mains; on battery Windows decides)"))
+                            : Opt(boost, "0,0", () => L.T("Без разгона: заметно холоднее и тише", "No boost: noticeably cooler and quieter"),
+                                () => L.T("процессор работает только на базовой частоте — тяжёлые программы и игры заметно медленнее", "the processor runs at base clock only — heavy programs and games are noticeably slower")),
                         Step(epp, m.Mobile ? "80,*" : "80,80", () => L.T("Процессор выбирает экономию и не держит высокую частоту без нужды", "The processor favours saving and keeps no high clocks it does not need") +
                             (m.Mobile ? L.T(" (от сети)", " (on mains)") : "")),
                         // Explicit, so a 100 % minimum or "all cores on" left from Games no longer keeps the clocks up.
@@ -735,8 +779,6 @@ namespace DriveUp
                     if (!m.Mobile && m.AnyHdd)
                         s.Add(Opt(disk, "300,300", () => L.T("Жёсткий диск останавливается через 5 минут простоя — тише", "The hard disk stops after 5 idle minutes — quieter"),
                             () => L.T("первое обращение к диску ждёт раскрутки 2–5 с", "the first access waits 2–5 s for spin-up")));
-                    if (m.SystemSsd && m.RamGb >= 15.5)
-                        s.Add(Step(sysMain, "disabled", () => L.T("Меньше фоновой работы диска", "Less background disk work")));
                     s.AddRange(common(m));
                     return s;
                 },
@@ -777,6 +819,11 @@ namespace DriveUp
             {
                 reason = L.T("ноутбук работает от батареи, так она продержится дольше", "the laptop is on battery, this makes it last longer");
                 return Mode("quiet");
+            }
+            if (m.Managed)
+            {
+                reason = L.T("компьютером управляет организация", "an organisation manages this computer");
+                return Mode("work");
             }
             if (m.GamingGpu.Length > 0)
             {
@@ -854,6 +901,12 @@ namespace DriveUp
         /// </summary>
         public static List<TuneRow> Plan(TuneMode mode, Machine m)
         {
+            // Every user's settings are read in one go (signed-out users' loaded once, not per setting).
+            using (AllUsers.Mount()) return PlanFor(mode, m);
+        }
+
+        static List<TuneRow> PlanFor(TuneMode mode, Machine m)
+        {
             Pc = m;
             var rows = new List<TuneRow>();
             var steps = StepsFor(mode, m);
@@ -862,9 +915,15 @@ namespace DriveUp
             {
                 var step = steps.First(s => s.Tweak.Id == t.Id);
                 string now;
-                try { now = t.Current(); }
+                bool same;
+                try
+                {
+                    // Shown as the person at the desktop has it; "already so" only when every user has it.
+                    string raw = t.CaptureAll();
+                    now = t.ValueOfAll(raw);
+                    same = t.AllMatch(raw, step.Value);
+                }
                 catch { continue; }
-                bool same = t.Matches(now, step.Value);
                 rows.Add(new TuneRow
                 {
                     Tweak = t, Category = t.Category, Kind = same ? TuneKind.Same : TuneKind.Change, Target = step.Value,
@@ -917,6 +976,11 @@ namespace DriveUp
         /// <summary>Everything DriveUP has changed and not put back yet: was → now.</summary>
         public static List<TuneRow> Changed()
         {
+            using (AllUsers.Mount()) return ChangedNow();
+        }
+
+        static List<TuneRow> ChangedNow()
+        {
             var rows = new List<TuneRow>();
             Dictionary<string, string> saved, when;
             lock (Settings.Sync)
@@ -928,18 +992,20 @@ namespace DriveUp
             {
                 var t = Find(kv.Key);
                 if (t == null) continue;
-                var row = new TuneRow { Tweak = t, Category = t.Category, Kind = TuneKind.Changed, Was = t.ValueOf(kv.Value), Checked = false };
+                var row = new TuneRow { Tweak = t, Category = t.Category, Kind = TuneKind.Changed, Was = t.ValueOfAll(kv.Value), Checked = false };
                 string raw = null;
-                try { raw = t.Capture(); row.Now = t.ValueOf(raw); }
+                try { raw = t.CaptureAll(); row.Now = t.ValueOfAll(raw); }
                 catch { row.Now = ""; }
-                // Already exactly as before DriveUP (put back by hand, or gone with its app): nothing to return.
+                string w;
+                when.TryGetValue(kv.Key, out w);
+                // Already exactly as before DriveUP for everyone it was changed for (put back by hand, or gone with
+                // its app): nothing to return.
                 if (raw != null && raw == kv.Value)
                 {
                     Forget(kv.Key);
                     continue;
                 }
-                string w;
-                if (when.TryGetValue(kv.Key, out w))
+                if (w != null)
                 {
                     var parts = w.Split('|');
                     row.ModeId = parts[0];
@@ -961,13 +1027,21 @@ namespace DriveUp
         /// </summary>
         public static void Change(Tweak t, string value, TuneMode mode)
         {
+            using (AllUsers.Mount()) ChangeNow(t, value, mode);
+        }
+
+        static void ChangeNow(Tweak t, string value, TuneMode mode)
+        {
             string raw = Saved(t.Id);
             bool fresh = raw == null;
-            string stamp = mode.Id + "|" + DateTime.Now.ToString("s", CultureInfo.InvariantCulture);
-            string extended = fresh ? null : t.Extend(raw);
+            // "mode|time|user": who was at the desktop.
+            string stamp = mode.Id + "|" + DateTime.Now.ToString("s", CultureInfo.InvariantCulture) + "|" + UserSid();
+            // Saved before 1.7 for the desktop user only: the other users' old states are read now (they are still
+            // as they were), so the change below — made for everyone — can go back for everyone.
+            string extended = fresh ? null : (t.Extend(raw) ?? t.WithAllUsers(raw));
             if (fresh || extended != null)
             {
-                if (fresh) raw = t.Capture();
+                if (fresh) raw = t.CaptureAll();
                 else raw = extended;
                 lock (Settings.Sync)
                 {
@@ -981,14 +1055,14 @@ namespace DriveUp
                     throw new System.IO.IOException(L.T("Не удалось сохранить прежнее значение — ничего не изменено", "Could not store the old value — nothing changed"));
                 }
             }
-            try { t.Set(value); }
+            try { t.SetAll(value); }
             catch
             {
                 if (fresh)
                 {
                     // Forgotten only once really back as it was; otherwise it stays under Changed.
                     bool back = false;
-                    try { t.Restore(raw); back = true; } catch { }
+                    try { t.RestoreAll(raw); back = true; } catch { }
                     if (back) Forget(t.Id);
                 }
                 throw;
@@ -996,18 +1070,25 @@ namespace DriveUp
             lock (Settings.Sync) Settings.TuneWhen[t.Id] = stamp;
             // Set back to exactly how it was before DriveUP: nothing left to return.
             string now = null;
-            try { now = t.Capture(); } catch { }
+            try { now = t.CaptureAll(); } catch { }
             if (now == raw) Forget(t.Id);
             else Settings.Save();
         }
 
-        /// <summary>Puts one setting back exactly as it was before DriveUP changed it.</summary>
+        /// <summary>Puts one setting back exactly as it was before DriveUP changed it (for every user it was changed for).</summary>
         public static void Return(Tweak t)
         {
             string raw = Saved(t.Id);
             if (raw == null) return;
-            t.Restore(raw);
+            t.RestoreAll(raw);
             Forget(t.Id);
+        }
+
+        /// <summary>The person at the desktop (recorded with a change).</summary>
+        static string UserSid()
+        {
+            try { return DesktopUser.OtherSid ?? AllUsers.MySid; }
+            catch { return ""; }
         }
 
         static void Forget(string id)
@@ -1030,6 +1111,7 @@ namespace DriveUp
             Pc = Machine.Read();
             int done = 0, failed = 0;
             var errors = new List<string>();
+            using (AllUsers.Mount())
             foreach (var r in Order(Changed().Where(x => x.Kind == TuneKind.Changed)))
             {
                 try { Return(r.Tweak); done++; }
@@ -1040,8 +1122,11 @@ namespace DriveUp
                 ? L.T("DriveUP ничего не менял — возвращать нечего.", "DriveUP changed nothing — there is nothing to return.")
                 : L.T("Возвращено как было: ", "Returned: ") + done + (failed > 0 ? L.T("\nНе удалось: ", "\nFailed: ") + failed + "\n" + string.Join("\n", errors) : "") +
                   L.T("\n\nПерезагрузите компьютер, чтобы всё применилось.", "\n\nRestart the computer for everything to apply.");
-            System.Windows.Forms.MessageBox.Show(text, "DriveUP", System.Windows.Forms.MessageBoxButtons.OK,
-                failed > 0 ? System.Windows.Forms.MessageBoxIcon.Warning : System.Windows.Forms.MessageBoxIcon.Information);
+            // Run where nobody can see a window (a scheduled task, remote management as SYSTEM): the journal and the
+            // exit code say it all — a message box there never closed and the process hung.
+            if (Environment.UserInteractive)
+                System.Windows.Forms.MessageBox.Show(text, "DriveUP", System.Windows.Forms.MessageBoxButtons.OK,
+                    failed > 0 ? System.Windows.Forms.MessageBoxIcon.Warning : System.Windows.Forms.MessageBoxIcon.Information);
             return failed;
         }
 

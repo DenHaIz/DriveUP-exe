@@ -192,7 +192,9 @@ namespace DriveUp
             // Hover and button hover change one row: only that row is painted again (the whole list cost
             // ~8 ms a frame at 150 %).
             bool oneRow = tag == "h" || tag == "b" || tag == "s";
-            Anim.Run(Tuple.Create(this, key, tag), ms, t => { map[key] = from + (to - from) * t; if (oneRow) InvalidateRow(key); else Invalidate(); }, done);
+            // A fold is eased where its height is read (H): linear here, or it was eased twice and snapped at the end.
+            Anim.Run(Tuple.Create(this, key, tag), ms, t => { map[key] = from + (to - from) * t; if (oneRow) InvalidateRow(key); else Invalidate(); }, done,
+                tag == "f" ? (Func<float, float>)(x => x) : null);
         }
 
         /// <summary>Repaints one row (where it is drawn now), or everything when it is not on screen.</summary>
@@ -243,7 +245,7 @@ namespace DriveUp
                 Anim.Frame(spinKey, () =>
                 {
                     if (IsDisposed || !rows.Any(r => r.State == TuneState.Working)) return false;
-                    if (Visible) foreach (var w in rows.Where(r => r.State == TuneState.Working).ToList()) InvalidateRow(w);
+                    if (Anim.Shown(this)) foreach (var w in rows.Where(r => r.State == TuneState.Working).ToList()) InvalidateRow(w);
                     return true;
                 });
             Invalidate();
@@ -299,8 +301,7 @@ namespace DriveUp
         void ScrollTo(float target)
         {
             scrollTarget = Math.Max(0, Math.Min(MaxScroll, target));
-            float from = scroll, to = scrollTarget;
-            Anim.Run(scrollKey, 220, t => { scroll = from + (to - from) * t; Invalidate(); });
+            Anim.Follow(scrollKey, () => scroll, v => { scroll = v; Invalidate(); }, () => scrollTarget);
         }
 
         protected override void OnMouseWheel(MouseEventArgs e)
@@ -680,7 +681,7 @@ namespace DriveUp
             if (r.State == TuneState.Working)
             {
                 float rad = S(9);
-                double ang = (Anim.Now * 0.4) % 360;
+                double ang = (Anim.FrameNow * 0.4) % 360;   // the frame's time: the same turn every refresh
                 using (var track = new Pen(Anim.Blend(bg, p.Border, a), Math.Max(2f, S(2) * 1.1f)))
                     g.DrawEllipse(track, cx - rad, cy - rad, rad * 2, rad * 2);
                 using (var pen = new Pen(Anim.Blend(bg, p.Accent, a * st), Math.Max(2f, S(2) * 1.1f)) { StartCap = LineCap.Round, EndCap = LineCap.Round })

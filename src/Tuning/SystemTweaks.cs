@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -156,6 +156,12 @@ namespace DriveUp
             }
         }
 
+        /// <summary>
+        /// A service the user (or the organisation) already disabled is "at least as off" as on demand: it is not
+        /// switched back to manual — that would let it start again.
+        /// </summary>
+        public override bool Matches(string now, string target) { return now == target || (target == "manual" && now == "disabled"); }
+
         public override void Set(string value)
         {
             switch (value)
@@ -252,14 +258,23 @@ namespace DriveUp
             if (p.Length == paths.Length) Write(p);
         }
 
+        /// <summary>
+        /// Tasks still read and put back (saved states hold one part per path, in order) but no longer switched off:
+        /// e.g. the Compatibility Appraiser, whose data Windows Update needs to offer the next feature update.
+        /// </summary>
+        public string[] Kept = new string[0];
+
+        bool IsKept(int i) { return Kept.Contains(paths[i], StringComparer.OrdinalIgnoreCase); }
+
         public override string ValueOf(string raw)
         {
-            return raw.Split('|').Any(x => x == "1") ? "1" : "0";
+            var p = raw.Split('|');
+            return p.Where((x, i) => i >= paths.Length || !IsKept(i)).Any(x => x == "1") ? "1" : "0";
         }
 
         public override void Set(string value)
         {
-            Write(Read().Select(x => x == "-" ? "-" : value).ToArray());
+            Write(Read().Select((x, i) => x == "-" || IsKept(i) ? "-" : value).ToArray());
         }
 
         public override string Describe(string value) { return value == "1" ? L.T("работают", "running") : L.T("отключены", "off"); }
@@ -571,7 +586,6 @@ namespace DriveUp
     class BackgroundApp : Tweak
     {
         const string Key = @"Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications\";
-        const string Families = @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Families\";
         public readonly string Family;
 
         public BackgroundApp(string family)
@@ -580,9 +594,10 @@ namespace DriveUp
             Id = "bg." + family;
             Category = TuneCat.Background;
             Glyph = "\uE71D";
+            PerUser = true;
         }
 
-        public override bool Available(Machine m) { return Reg.KeyExists(false, Families + Family); }
+        public override bool Available(Machine m) { return Appx.Has(Family); }
 
         public override string Capture() { return Reg.Capture(false, Key + Family, "Disabled") + "|" + Reg.Capture(false, Key + Family, "DisabledByUser"); }
 
@@ -712,7 +727,7 @@ namespace DriveUp
         string[] Read()
         {
             if (Reg.TestRoot != null) return (Reg.Get(false, "Access", "Hotkeys") as string ?? "1,1,1").Split(',');
-            if (DesktopUser.Other) return Enumerable.Range(0, 3).Select(i => (RegFlags(i) & HotkeyActive) != 0 ? "1" : "0").ToArray();
+            if (Reg.TargetIsOther) return Enumerable.Range(0, 3).Select(i => (RegFlags(i) & HotkeyActive) != 0 ? "1" : "0").ToArray();
             var r = new string[3];
             for (int i = 0; i < 3; i++) r[i] = (Flags(i) & HotkeyActive) != 0 ? "1" : "0";
             return r;
@@ -734,7 +749,7 @@ namespace DriveUp
         void Write(string[] on)
         {
             if (Reg.TestRoot != null) { Reg.SetString(false, "Access", "Hotkeys", string.Join(",", on)); return; }
-            if (DesktopUser.Other)
+            if (Reg.TargetIsOther)
             {
                 for (int i = 0; i < 3; i++)
                 {

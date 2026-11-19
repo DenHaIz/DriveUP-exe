@@ -74,6 +74,8 @@ namespace DriveUp
         {
             text = text ?? "";
             if (text == Text) return;
+            // Only a number changed (a total, a count): swapped in place; a fade under way carries on to it.
+            if (Anim.OnlyNumbersDiffer(text, Text)) { Text = text; Invalidate(); return; }
             // Mid-fade the line still mostly shows the old text: keep fading that one out.
             if (alpha.Value >= 0.5f) previous = Text;
             Text = text;
@@ -245,7 +247,7 @@ namespace DriveUp
             Anim.Frame(key, () =>
             {
                 if (c.IsDisposed || !loading()) return false;
-                if (c.Visible) c.Invalidate();
+                if (Anim.Shown(c)) c.Invalidate();
                 return true;
             });
         }
@@ -481,8 +483,7 @@ namespace DriveUp
         void ScrollTo(float target)
         {
             scrollTarget = Math.Max(0, Math.Min(MaxScroll, target));
-            float from = scroll, to = scrollTarget;
-            Anim.Run(scrollKey, 220, t => { scroll = from + (to - from) * t; Invalidate(); });
+            Anim.Follow(scrollKey, () => scroll, v => { scroll = v; Invalidate(); }, () => scrollTarget);
         }
 
         protected override void OnMouseWheel(MouseEventArgs e)

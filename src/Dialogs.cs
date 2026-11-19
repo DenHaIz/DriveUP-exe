@@ -151,7 +151,8 @@ namespace DriveUp
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            if (!closingDone)
+            // Windows restarting or shutting down: closed at once (held open, it blocked the restart).
+            if (!closingDone && e.CloseReason != CloseReason.WindowsShutDown && e.CloseReason != CloseReason.TaskManagerClosing)
             {
                 // Title-bar close or Alt+F4: fade out first, then close for real.
                 e.Cancel = true;

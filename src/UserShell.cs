@@ -188,13 +188,25 @@ namespace DriveUp
     /// </summary>
     static class DesktopUser
     {
-        static bool read;
+        static volatile bool read;
         static string sid, name = "", profile;
+        static readonly object sync = new object();
 
         static void Read()
         {
             if (read) return;
-            read = true;
+            // One lookup, and nobody reads the answer before it is there (a second thread saw "same account" while
+            // the first was still looking, and changed the administrator's settings instead of the desktop user's).
+            lock (sync)
+            {
+                if (read) return;
+                try { Lookup(); }
+                finally { read = true; }
+            }
+        }
+
+        static void Lookup()
+        {
             try
             {
                 string shellName;
@@ -229,6 +241,170 @@ namespace DriveUp
             Func<string, string> expand = s => System.Text.RegularExpressions.Regex.Replace(s, "%USERPROFILE%", home.Replace("$", "$$"), System.Text.RegularExpressions.RegexOptions.IgnoreCase);
             raw = System.Text.RegularExpressions.Regex.Replace(raw, "%APPDATA%", expand(appData).Replace("$", "$$"), System.Text.RegularExpressions.RegexOptions.IgnoreCase);
             return home.Length == 0 && raw.IndexOf("%USERPROFILE%", StringComparison.OrdinalIgnoreCase) >= 0 ? "" : expand(raw);
+        }
+    }
+
+    /// <summary>
+    /// Every user of this computer. DriveUP runs as administrator, so a per-user setting (ads, privacy, menu delay...)
+    /// is changed for all of them, not only for whoever happens to be at the desktop: those signed in through their
+    /// loaded settings, the others by loading their NTUSER.DAT for the moment it takes, and the default profile new
+    /// accounts are copied from. Each one's old state is kept separately and goes back to that same user.
+    /// </summary>
+    static class AllUsers
+    {
+        /// <summary>The name the default profile (C:\Users\Default) is loaded under while it is changed.</summary>
+        public const string DefaultUser = "DriveUP.DefaultUser";
+
+        static string mySid;
+        public static string MySid
+        {
+            get
+            {
+                if (mySid == null) using (var id = WindowsIdentity.GetCurrent()) mySid = id.User.Value;
+                return mySid;
+            }
+        }
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)] static extern int RegLoadKeyW(IntPtr key, string sub, string file);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)] static extern int RegUnLoadKeyW(IntPtr key, string sub);
+        static readonly IntPtr HKEY_USERS = new IntPtr(unchecked((int)0x80000003));
+
+        static readonly object sync = new object();
+        static int mounts;
+        /// <summary>Hives this program loaded (signed-out users, the default profile), unloaded when the batch ends.</summary>
+        static readonly System.Collections.Generic.List<string> loaded = new System.Collections.Generic.List<string>();
+        static System.Collections.Generic.List<string> sids;
+
+        /// <summary>
+        /// The users whose settings a batch of reads or changes covers. Loads signed-out users' settings; dispose to
+        /// unload them right after (held loaded, a user signing in meanwhile could get a temporary profile).
+        /// </summary>
+        public static IDisposable Mount()
+        {
+            lock (sync)
+            {
+                if (mounts++ == 0) sids = Load();
+            }
+            return new Unmounter();
+        }
+
+        class Unmounter : IDisposable
+        {
+            bool done;
+            public void Dispose()
+            {
+                if (done) return;
+                done = true;
+                lock (sync)
+                {
+                    if (--mounts > 0) return;
+                    Unload();
+                    sids = null;
+                }
+            }
+        }
+
+        /// <summary>Users of the current batch (empty outside one: then only the desktop user is meant).</summary>
+        public static System.Collections.Generic.List<string> Sids
+        {
+            get { lock (sync) return sids != null ? new System.Collections.Generic.List<string>(sids) : new System.Collections.Generic.List<string>(); }
+        }
+
+        /// <summary>Runs work with the per-user settings (Reg with machine = false) pointing at this user's.</summary>
+        public static void With(string sid, Action work)
+        {
+            Reg.SetUser(sid);
+            try { work(); }
+            finally { Reg.SetUser(null); }
+        }
+
+        static System.Collections.Generic.List<string> Load()
+        {
+            var list = new System.Collections.Generic.List<string>();
+            try
+            {
+                Privileges();
+                using (var users = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.Users, Microsoft.Win32.RegistryView.Registry64))
+                using (var profiles = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"))
+                {
+                    if (profiles == null) return list;
+                    foreach (string sid in profiles.GetSubKeyNames())
+                    {
+                        // People's accounts only: local and Microsoft accounts (S-1-5-21-…) and Entra ID (S-1-12-1-…).
+                        if (!System.Text.RegularExpressions.Regex.IsMatch(sid, @"^S-1-(5-21|12-1)-[\d-]+$")) continue;
+                        if (Present(users, sid)) { list.Add(sid); continue; }
+                        // Unelevated (the test build) nothing else can be loaded or written: this account only.
+                        if (!SafePath.Elevated) continue;
+                        string dir;
+                        using (var p = profiles.OpenSubKey(sid))
+                            dir = p == null ? null : Environment.ExpandEnvironmentVariables(Convert.ToString(p.GetValue("ProfileImagePath")) ?? "");
+                        if (TryLoad(sid, dir)) list.Add(sid);
+                    }
+                    // New accounts are made from the default profile: they start with the same settings.
+                    string def = Environment.ExpandEnvironmentVariables(Convert.ToString(profiles.GetValue("Default")) ?? "");
+                    if (SafePath.Elevated && def.Length > 0 && TryLoad(DefaultUser, def)) list.Add(DefaultUser);
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        static bool Present(Microsoft.Win32.RegistryKey users, string sid)
+        {
+            try { using (var k = users.OpenSubKey(sid)) return k != null; }
+            catch { return false; }   // another signed-in user's settings an unelevated copy may not open
+        }
+
+        static bool TryLoad(string name, string dir)
+        {
+            if (string.IsNullOrEmpty(dir)) return false;
+            string file = Path.Combine(dir, "NTUSER.DAT");
+            if (!File.Exists(file) || SafePath.IsLink(dir)) return false;
+            if (RegLoadKeyW(HKEY_USERS, name, file) != 0) return false;   // in use, damaged or not ours to load: skipped
+            loaded.Add(name);
+            return true;
+        }
+
+        static void Unload()
+        {
+            foreach (var name in loaded)
+                for (int attempt = 0; attempt < 5; attempt++)
+                {
+                    // Every handle into the hive must be closed first: collect any the GC still holds.
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    if (RegUnLoadKeyW(HKEY_USERS, name) == 0) break;
+                    System.Threading.Thread.Sleep(200);
+                }
+            loaded.Clear();
+        }
+
+        // ---------- SeBackupPrivilege / SeRestorePrivilege: loading another user's hive needs both ----------
+
+        [StructLayout(LayoutKind.Sequential)] struct LUID { public uint Low; public int High; }
+        [StructLayout(LayoutKind.Sequential)] struct TOKEN_PRIVILEGES { public int Count; public LUID Luid; public int Attributes; }
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, int access, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool LookupPrivilegeValueW(string system, string name, out LUID luid);
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TOKEN_PRIVILEGES state, int len, IntPtr prev, IntPtr retLen);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+        static bool privileged;
+
+        static void Privileges()
+        {
+            if (privileged) return;
+            IntPtr token;
+            if (!OpenProcessToken(GetCurrentProcess(), 0x20 | 0x8 /* ADJUST_PRIVILEGES | QUERY */, out token)) return;
+            try
+            {
+                foreach (var name in new[] { "SeBackupPrivilege", "SeRestorePrivilege" })
+                {
+                    var tp = new TOKEN_PRIVILEGES { Count = 1, Attributes = 2 /* SE_PRIVILEGE_ENABLED */ };
+                    if (LookupPrivilegeValueW(null, name, out tp.Luid)) AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+                }
+                privileged = true;
+            }
+            finally { CloseHandle(token); }
         }
     }
 }

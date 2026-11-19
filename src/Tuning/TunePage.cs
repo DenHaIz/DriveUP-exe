@@ -531,27 +531,29 @@ namespace DriveUp
                     else if (!ok && why != null && !SysRestore.Unsupported)
                         Post(() => Host.ShowToast(L.T("Без точки восстановления: ", "No restore point: ") + why, ToastKind.Info));
                 }
-                foreach (var row in Tuner.Order(todo))
-                {
-                    var r = row;
-                    Post(() => list.SetState(r, TuneState.Working));
-                    Thread.Sleep(70);   // long enough to see each one being done
-                    try
+                // Signed-out users' settings stay loaded for the whole run, not once per setting.
+                using (AllUsers.Mount())
+                    foreach (var row in Tuner.Order(todo))
                     {
-                        if (r.Kind == TuneKind.Return) Tuner.Return(r.Tweak);
-                        else Tuner.Change(r.Tweak, r.Target, mode);
-                        done++;
-                        names.Add(r.Tweak.Name());
-                        if (r.Tweak.NeedsReboot) reboot = true;
-                        Post(() => list.SetState(r, TuneState.Done));
+                        var r = row;
+                        Post(() => list.SetState(r, TuneState.Working));
+                        Thread.Sleep(70);   // long enough to see each one being done
+                        try
+                        {
+                            if (r.Kind == TuneKind.Return) Tuner.Return(r.Tweak);
+                            else Tuner.Change(r.Tweak, r.Target, mode);
+                            done++;
+                            names.Add(r.Tweak.Name());
+                            if (r.Tweak.NeedsReboot) reboot = true;
+                            Post(() => list.SetState(r, TuneState.Done));
+                        }
+                        catch (Exception ex)
+                        {
+                            failed++;
+                            string msg = ErrorText(ex);
+                            Post(() => list.SetState(r, TuneState.Failed, msg));
+                        }
                     }
-                    catch (Exception ex)
-                    {
-                        failed++;
-                        string msg = ErrorText(ex);
-                        Post(() => list.SetState(r, TuneState.Failed, msg));
-                    }
-                }
                 if (done > 0) Tuner.SetMode(mode.Id);
                 Journal.Add(JournalKind.Tune, done, failed, mode.Name() + ": " + string.Join(", ", names));
                 Thread.Sleep(250);
@@ -601,6 +603,7 @@ namespace DriveUp
                 int done = 0, failed = 0;
                 bool reboot = false;
                 var names = new List<string>();
+                using (AllUsers.Mount())
                 foreach (var row in Tuner.Order(rows))
                 {
                     var r = row;

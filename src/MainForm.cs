@@ -32,6 +32,7 @@ namespace DriveUp
         bool compactTheme, instantTab;
         /// <summary>Closing was asked for while Windows Update installed: the window closes once it has stopped.</summary>
         bool closing;
+        DateTime closingAt;
         public int StartTab;
         public string[] StartPaths;
 
@@ -254,13 +255,21 @@ namespace DriveUp
             {
                 // Windows Update can be asked to stop (e.g. when it hangs): then the window closes by itself.
                 e.Cancel = true;
-                if (closing) return;
+                if (closing)
+                {
+                    // Asked to stop over a minute ago and the agent still has not let go: a second close closes anyway
+                    // (Windows finishes or rolls back the driver on its own); before, the window could not be closed at all.
+                    if ((DateTime.UtcNow - closingAt).TotalSeconds > 60) { e.Cancel = false; base.OnFormClosing(e); }
+                    else ShowToast(L.T("Останавливаю Windows Update… Если не закроется за минуту, закройте окно ещё раз", "Stopping Windows Update… If it does not close within a minute, close the window again"), ToastKind.Info);
+                    return;
+                }
                 if (ThemedDialog.Confirm(this, L.T("Прервать установку?", "Stop the install?"),
                         L.T("Windows Update ещё скачивает или устанавливает драйверы. Прервать и закрыть окно?\nДрайвер, который ставится прямо сейчас, Windows доустановит или откатит сама.",
                             "Windows Update is still downloading or installing drivers. Stop and close the window?\nThe driver being installed right now is finished or rolled back by Windows."),
                         L.T("Прервать и закрыть", "Stop and close"), "\uE711", true))
                 {
                     closing = true;
+                    closingAt = DateTime.UtcNow;
                     WinUpdate.RequestAbort();
                     ShowToast(L.T("Останавливаю Windows Update…", "Stopping Windows Update…"), ToastKind.Info);
                     // A few checks a second are enough (the animation clock would poll at display rate for minutes).

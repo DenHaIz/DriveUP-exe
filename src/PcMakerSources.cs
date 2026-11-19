@@ -196,13 +196,21 @@ namespace DriveUp
                 {
                     Vendor = "Dell", Device = kv.Key, VersionText = kv.Value.Item2, CurrentText = kv.Key.VersionText, Title = name,
                     Date = DateTime.TryParse(sc.GetAttribute("releaseDate"), CultureInfo.InvariantCulture, DateTimeStyles.None, out date) ? (DateTime?)date : null,
-                    Url = page.StartsWith("https://", StringComparison.OrdinalIgnoreCase) && new Uri(page).Host.EndsWith("dell.com", StringComparison.OrdinalIgnoreCase)
-                        ? page : "https://www.dell.com/support/home/?app=drivers",
+                    // One malformed address must not throw (that lost every Dell result); "evildell.com" is not Dell.
+                    Url = DellPage(page) ? page : "https://www.dell.com/support/home/?app=drivers",
                 };
                 Package(sc, v);
                 result.Add(v);
             }
             return result;
+        }
+
+        static bool DellPage(string page)
+        {
+            Uri u;
+            if (!Uri.TryCreate(page, UriKind.Absolute, out u) || u.Scheme != Uri.UriSchemeHttps) return false;
+            string h = u.Host.ToLowerInvariant();
+            return h == "dell.com" || h.EndsWith(".dell.com");
         }
 
         /// <summary>

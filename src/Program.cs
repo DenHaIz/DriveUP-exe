@@ -18,6 +18,9 @@ namespace DriveUp
             Path.GetFileNameWithoutExtension(Application.ExecutablePath).EndsWith(".dev", StringComparison.OrdinalIgnoreCase)
                 ? "DriveUP.Dev" : "DriveUP";
 
+        /// <summary>The saved settings' lock, the same for every session and for the release and test builds.</summary>
+        const string StoreMutex = @"Global\DriveUP.SettingsStore";
+
         [DllImport("user32.dll")]
         static extern bool PostMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam);
 
@@ -62,10 +65,11 @@ namespace DriveUp
             // (for when something went wrong and the tab is out of reach).
             if (args.Any(a => a.Equals("/restore", StringComparison.OrdinalIgnoreCase)))
             {
-                bool alone;
+                bool alone, aloneEverywhere;
                 using (var lockWindow = new Mutex(true, @"Local\" + Instance + ".SingleInstance", out alone))
+                using (var lockStore = new Mutex(true, StoreMutex, out aloneEverywhere))
                 {
-                    if (!alone)
+                    if (!alone || !aloneEverywhere)
                     {
                         MessageBox.Show(L.T("Закройте окно DriveUP и запустите возврат снова — или верните всё в окне: «Оптимизация» → «Изменено» → «Вернуть всё».",
                                             "Close the DriveUP window and run the return again — or return everything in the window: Tuning → Changed → Return all."),
@@ -86,6 +90,22 @@ namespace DriveUp
                     else PostMessage((IntPtr)0xFFFF /* HWND_BROADCAST */, MainForm.ShowMessage, (IntPtr)tab, IntPtr.Zero);
                     return 0;
                 }
+                // One copy on the whole computer: the saved old states of the settings are one list for the machine, and
+                // two copies (another user's session, or DriveUP.exe next to DriveUP.dev.exe) each wrote back their own
+                // and erased the other's — what one of them changed could then never be returned.
+                bool firstEverywhere;
+                Mutex store = null;
+                // An elevated copy's lock may not even be opened by an unelevated one: taken, too.
+                try { store = new Mutex(true, StoreMutex, out firstEverywhere); }
+                catch (UnauthorizedAccessException) { firstEverywhere = false; }
+                if (!firstEverywhere)
+                {
+                    if (store != null) store.Dispose();
+                    MessageBox.Show(L.T("DriveUP уже открыт — у другого пользователя этого компьютера или второй копией. Закройте его и запустите снова.",
+                                        "DriveUP is already open — by another user of this computer or as a second copy. Close it and start again."),
+                        "DriveUP", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return 1;
+                }
 
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
@@ -101,6 +121,8 @@ namespace DriveUp
                 if (tab >= 1 && tab <= 5) form.StartTab = tab - 1;
                 if (paths.Length > 0) form.StartPaths = paths;
                 Application.Run(form);
+                GC.KeepAlive(store);   // held for as long as the window is open
+                store.Dispose();
             }
             return 0;
         }

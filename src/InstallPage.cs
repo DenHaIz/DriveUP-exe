@@ -102,7 +102,10 @@ namespace DriveUp
             int barY = drop.Bottom + S(10);
             bar.SetBounds(pad, barY, Width - pad * 2, S(44));
             int listY = bar.Bottom + S(6);
-            listHost.SetBounds(pad, listY, Width - pad * 2, Math.Max(S(40), Height - listY - S(4)));
+            // The list keeps the height it has once the drop area is a strip and only moves while that animates:
+            // resized every frame it re-fitted its columns and repainted whole, and the collapse stuttered.
+            int finalY = pad + small + S(10) + S(44) + S(6);
+            listHost.SetBounds(pad, listY, Width - pad * 2, Math.Max(S(40), Height - finalY - S(4)));
             LayoutDropButtons();
         }
 

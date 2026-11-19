@@ -156,6 +156,15 @@ namespace DriveUp
         [DllImport("wintrust.dll", CharSet = CharSet.Unicode)]
         static extern int WinVerifyTrust(IntPtr hwnd, ref Guid action, ref WINTRUST_DATA data);
 
+        /// <summary>Where Microsoft's downloads come from (aka.ms forwards to these): every hop must be one of them.</summary>
+        static bool MicrosoftHost(Uri u)
+        {
+            string h = u.Host.ToLowerInvariant();
+            return u.IsDefaultPort && u.UserInfo.Length == 0 &&
+                   (h == "aka.ms" || h == "microsoft.com" || h.EndsWith(".microsoft.com") || h.EndsWith(".windowsupdate.com") ||
+                    h.EndsWith(".microsoft.net") || h == "builds.dotnet.microsoft.com" || h.EndsWith(".dotnet.microsoft.com"));
+        }
+
         /// <summary>A valid Authenticode signature (whole chain, revocation checked) by Microsoft Corporation.</summary>
         public static bool SignedByMicrosoft(string file)
         {
@@ -166,8 +175,30 @@ namespace DriveUp
         /// <summary>True when a certificate subject has this part exactly ("O=Intel Corporation"), case aside.</summary>
         public static bool HasPart(string subject, string key, string value)
         {
-            return Regex.IsMatch(subject, @"(^|,\s*)" + key + "=" + Regex.Escape(value) + @"\s*(,|$)", RegexOptions.IgnoreCase) ||
-                   Regex.IsMatch(subject, @"(^|,\s*)" + key + "=\"" + Regex.Escape(value) + "\"\\s*(,|$)", RegexOptions.IgnoreCase);
+            // Split into its parts the way the name is written: a comma inside quotes belongs to the value
+            // (a pattern search also found "O=Intel Corporation" inside OU="x, O=Intel Corporation, y").
+            var parts = new List<string>();
+            var cur = new System.Text.StringBuilder();
+            bool quoted = false;
+            for (int i = 0; i < (subject ?? "").Length; i++)
+            {
+                char c = subject[i];
+                if (c == '"') { quoted = !quoted; cur.Append(c); }
+                else if (c == '\\' && i + 1 < subject.Length) { cur.Append(c).Append(subject[++i]); }
+                else if ((c == ',' || c == ';') && !quoted) { parts.Add(cur.ToString()); cur.Clear(); }
+                else cur.Append(c);
+            }
+            parts.Add(cur.ToString());
+            foreach (var part in parts)
+            {
+                int eq = part.IndexOf('=');
+                if (eq <= 0) continue;
+                if (!part.Substring(0, eq).Trim().Equals(key, StringComparison.OrdinalIgnoreCase)) continue;
+                string v = part.Substring(eq + 1).Trim();
+                if (v.Length >= 2 && v[0] == '"' && v[v.Length - 1] == '"') v = v.Substring(1, v.Length - 2).Replace("\"\"", "\"");
+                if (v.Equals(value, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -254,7 +285,7 @@ namespace DriveUp
         {
             string dir = InfFiles.NewDownloadDir();
             string file = Path.Combine(dir, r.Unpack ? "directx_redist.exe" : "setup.exe");
-            VendorCheck.DownloadFile(r.Url, file, 400L << 20);
+            VendorCheck.DownloadFile(r.Url, file, 400L << 20, MicrosoftHost);
             if (!SignedByMicrosoft(file)) throw new IOException(L.T("файл не подписан Microsoft — не запускаю", "the file is not signed by Microsoft — not running it"));
             if (!r.Unpack) return Run(file, r.Args, 900000);
             // DirectX: unpack quietly into the protected folder, then run its own setup (checked as well).

@@ -181,11 +181,17 @@ namespace DriveUp
                 if (d.Exists && d.Parent != null && SafePath.IsLink(d.FullName))
                     throw new IOException(L.T("папка копий ведёт по ссылке в другое место — выберите обычную папку",
                         "the backup folder is a link to another place — choose a regular folder"));
+            Directory.CreateDirectory(root);
             string name = DateTime.Now.ToString("yyyy-MM-dd HH-mm", CultureInfo.InvariantCulture);
             string path = Path.Combine(root, name);
-            for (int i = 2; Directory.Exists(path); i++) path = Path.Combine(root, name + " (" + i + ")");
-            Directory.CreateDirectory(path);
-            Protect(path);
+            // Made new, with its permissions from the first moment: a folder someone else made (or made first, racing
+            // for the predictable name) is never reused — they could slip links into it while the copy runs.
+            var sec = Protection();
+            for (int i = 2; !SafePath.CreateNew(path, sec); i++)
+            {
+                if (i > 100) throw new IOException(L.T("не удалось создать папку копии", "could not create the backup folder"));
+                path = Path.Combine(root, name + " (" + i + ")");
+            }
             if (SafePath.IsLink(path))
                 throw new IOException(L.T("папка копий подменена ссылкой", "the backup folder was replaced by a link"));
             return path;
@@ -195,28 +201,33 @@ namespace DriveUp
         /// Only administrators, SYSTEM and this user may change the new folder, so nobody else can slip a
         /// link into it while the copy runs (matters when the backup root is on a shared drive).
         /// </summary>
-        static void Protect(string path)
+        static System.Security.AccessControl.DirectorySecurity Protection()
         {
-            try
+            var sec = new System.Security.AccessControl.DirectorySecurity();
+            sec.SetAccessRuleProtection(true, false);
+            const System.Security.AccessControl.InheritanceFlags inherit =
+                System.Security.AccessControl.InheritanceFlags.ContainerInherit | System.Security.AccessControl.InheritanceFlags.ObjectInherit;
+            var sids = new List<System.Security.Principal.SecurityIdentifier>
             {
-                var sec = new System.Security.AccessControl.DirectorySecurity();
-                sec.SetAccessRuleProtection(true, false);
-                const System.Security.AccessControl.InheritanceFlags inherit =
-                    System.Security.AccessControl.InheritanceFlags.ContainerInherit | System.Security.AccessControl.InheritanceFlags.ObjectInherit;
-                foreach (var sid in new System.Security.Principal.SecurityIdentifier[]
+                new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null),
+                new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.LocalSystemSid, null),
+                System.Security.Principal.WindowsIdentity.GetCurrent().User,
+            };
+            foreach (var sid in sids)
+                sec.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(sid, System.Security.AccessControl.FileSystemRights.FullControl,
+                    inherit, System.Security.AccessControl.PropagationFlags.None, System.Security.AccessControl.AccessControlType.Allow));
+            // Elevated with another account's password: the person at the desktop can open their backups (read only,
+            // so they cannot slip anything into the folder while administrator rights write to it).
+            string other = DesktopUser.OtherSid;
+            if (other != null)
+                try
                 {
-                    new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null),
-                    new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.LocalSystemSid, null),
-                    System.Security.Principal.WindowsIdentity.GetCurrent().User,
-                })
-                    sec.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(sid, System.Security.AccessControl.FileSystemRights.FullControl,
-                        inherit, System.Security.AccessControl.PropagationFlags.None, System.Security.AccessControl.AccessControlType.Allow));
-                Directory.SetAccessControl(path, sec);
-            }
-            catch (UnauthorizedAccessException) { }
-            catch (InvalidOperationException) { }
-            catch (NotSupportedException) { }   // FAT, some network shares: no permissions to set
-            catch (IOException) { }
+                    sec.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(new System.Security.Principal.SecurityIdentifier(other),
+                        System.Security.AccessControl.FileSystemRights.ReadAndExecute, inherit, System.Security.AccessControl.PropagationFlags.None,
+                        System.Security.AccessControl.AccessControlType.Allow));
+                }
+                catch { }
+            return sec;
         }
 
         /// <summary>

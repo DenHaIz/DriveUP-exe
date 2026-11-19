@@ -288,6 +288,7 @@ namespace DriveUp
             using (var s = resp.GetResponseStream())
             using (var ms = new MemoryStream())
             {
+                NoDowngrade(rq, resp);
                 var buf = new byte[65536];
                 int n;
                 while ((n = s.Read(buf, 0, buf.Length)) > 0)
@@ -297,6 +298,13 @@ namespace DriveUp
                 }
                 return ms.ToArray();
             }
+        }
+
+        /// <summary>An HTTPS request that a redirect took to plain HTTP: its answer (a feed, hashes, links) is not used.</summary>
+        static void NoDowngrade(HttpWebRequest rq, HttpWebResponse resp)
+        {
+            if (rq.RequestUri.Scheme == Uri.UriSchemeHttps && resp.ResponseUri != null && resp.ResponseUri.Scheme != Uri.UriSchemeHttps)
+                throw new IOException(L.T("сервер перенаправил на незащищённый адрес", "the server redirected to an unencrypted address"));
         }
 
         /// <summary>POST of a form (application/x-www-form-urlencoded); the answer as text (a few MB at most).</summary>
@@ -322,6 +330,7 @@ namespace DriveUp
             using (var resp = answer)
             using (var r = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
             {
+                NoDowngrade(rq, resp);
                 var buf = new char[65536];
                 var sb = new StringBuilder();
                 int n;
@@ -352,7 +361,9 @@ namespace DriveUp
                     rq.UserAgent = Agent;
                     rq.Timeout = 30000;
                     rq.ReadWriteTimeout = 60000;
-                    rq.AllowAutoRedirect = allowHost == null;
+                    // Redirects are always followed here, one by one: each hop must be HTTPS too (on its own, .NET
+                    // follows https → http, where anyone on the way could hand over a different signed file).
+                    rq.AllowAutoRedirect = false;
                     using (var resp = (HttpWebResponse)rq.GetResponse())
                     {
                         int code = (int)resp.StatusCode;

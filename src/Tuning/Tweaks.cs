@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -43,7 +43,8 @@ namespace DriveUp
         /// Ryzen 9 with 3D V-Cache on one of two dies (7900X3D, 7950X3D, 9900X3D, 9950X3D): AMD's driver parks
         /// the other die's cores during games, so core parking must stay as Windows has it.
         /// </summary>
-        public bool DualCcdX3D { get { return Regex.IsMatch(Cpu, @"\b(79|99)[05]0X3D\b", RegexOptions.IgnoreCase); } }
+        /// (Any X3D with more than 8 cores has two dies: also 9950X3D2 and the laptop 7945HX3D / 9955HX3D.)
+        public bool DualCcdX3D { get { return Cpu.IndexOf("X3D", StringComparison.OrdinalIgnoreCase) >= 0 && Cores > 8; } }
 
         public bool Windows11 { get { return Build >= 22000; } }
         /// <summary>
@@ -66,7 +67,8 @@ namespace DriveUp
             parts.Add((Server ? "Windows Server" : "Windows " + (Windows11 ? "11" : "10")));
             if (Managed) parts.Add(L.T("управляется организацией", "managed by an organisation"));
             // Elevated with another account's password: whose settings are changed.
-            if (DesktopUser.Other) parts.Add(L.T("настройки пользователя ", "settings of ") + DesktopUser.Name);
+            // Per-user settings change for every user of the PC; the list shows them as this one has them.
+            if (DesktopUser.Other) parts.Add(L.T("показано для ", "shown for ") + DesktopUser.Name);
             return string.Join(" · ", parts);
         }
 
@@ -193,11 +195,14 @@ namespace DriveUp
 
         public static bool IsGaming(string name, string id)
         {
-            if (id.Contains("VEN_10DE")) return true;
+            // Not every NVIDIA chip is for games: MX / GT in office laptops, Quadro / T-series / RTX A / Ada workstation cards.
+            if (id.Contains("VEN_10DE"))
+                return !Regex.IsMatch(name, @"\bMX\s?\d|\bGT\s?\d|Quadro|\bNVS\b|\bT\d{3,4}\b|RTX\s+A\d|Ada Generation|RTX\s+PRO", RegexOptions.IgnoreCase);
             if (id.Contains("VEN_1002"))
                 return Regex.IsMatch(name, @"\bRX\s?\d|Radeon\s+Pro|Vega\s+(56|64)|Radeon\s+VII", RegexOptions.IgnoreCase);
-            // "Intel(R) Arc(TM) Graphics" is the built-in one of Core Ultra; the cards are A380, A770, B580...
-            if (id.Contains("VEN_8086")) return Regex.IsMatch(name, @"Arc(\(TM\))?\s+[AB]\d{3}", RegexOptions.IgnoreCase);
+            // "Intel(R) Arc(TM) Graphics" is the built-in one of Core Ultra, and so are Panther Lake's "Arc B370 / B390";
+            // the cards are A380, A770, A570M, B570, B580...
+            if (id.Contains("VEN_8086")) return Regex.IsMatch(name, @"Arc(\(TM\))?\s+(A\d{3}M?|B[5-9]\d{2})\b", RegexOptions.IgnoreCase);
             return false;
         }
 
@@ -220,6 +225,24 @@ namespace DriveUp
         /// <summary>Tests: every key goes under HKCU\TestRoot\HKLM|HKCU\... instead of the real place.</summary>
         public static string TestRoot;
 
+        /// <summary>Whose per-user settings are read and written on this thread (see <see cref="AllUsers.With"/>); null: the desktop user.</summary>
+        [ThreadStatic] static string userOverride;
+
+        public static void SetUser(string sid) { userOverride = sid; }
+
+        /// <summary>
+        /// The per-user settings being changed are not those of the account DriveUP runs as: they are written to that
+        /// user's hive, and Windows' live calls (SystemParametersInfo), which reach only this account, are not used.
+        /// </summary>
+        public static bool TargetIsOther
+        {
+            get
+            {
+                string sid = userOverride ?? DesktopUser.OtherSid;
+                return sid != null && !sid.Equals(AllUsers.MySid, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
         static RegistryKey Key(bool machine, string path, bool write, bool create)
         {
             if (TestRoot != null)
@@ -227,7 +250,7 @@ namespace DriveUp
                 string p = TestRoot + "\\" + (machine ? "HKLM" : "HKCU") + "\\" + path;
                 return create ? Registry.CurrentUser.CreateSubKey(p) : Registry.CurrentUser.OpenSubKey(p, write);
             }
-            string other = machine ? null : DesktopUser.OtherSid;
+            string other = machine ? null : (userOverride ?? DesktopUser.OtherSid);
             if (other != null)
             {
                 // Elevated as another account: the person at the desktop's own hive.
@@ -378,9 +401,16 @@ namespace DriveUp
         {
             get
             {
+                // The class registered and its DLL really there (gpedit.dll: Home editions have neither).
                 try
                 {
-                    using (var k = Registry.ClassesRoot.OpenSubKey(@"CLSID\{" + GroupPolicyObject + @"}\InProcServer32")) return k != null;
+                    using (var k = Registry.ClassesRoot.OpenSubKey(@"CLSID\{" + GroupPolicyObject + @"}\InProcServer32"))
+                    {
+                        string dll = k != null ? Environment.ExpandEnvironmentVariables(Convert.ToString(k.GetValue(null)) ?? "") : "";
+                        if (dll.Length == 0) return false;
+                        if (!System.IO.Path.IsPathRooted(dll)) dll = System.IO.Path.Combine(Environment.SystemDirectory, dll);
+                        return System.IO.File.Exists(dll);
+                    }
                 }
                 catch { return false; }
             }
@@ -496,6 +526,125 @@ namespace DriveUp
         public virtual string Extend(string saved) { return null; }
 
         public string Current() { return ValueOf(Capture()); }
+
+        // ---------- every user of the PC ----------
+
+        /// <summary>
+        /// Its values live in each user's own settings (HKCU): read, changed and put back for every user of the PC
+        /// (<see cref="AllUsers"/>), each with their own old state. The *All methods are what the tuner calls.
+        /// </summary>
+        public bool PerUser;
+
+        const string UsersTag = "users:";
+
+        bool Multi { get { return PerUser && Reg.TestRoot == null; } }
+
+        /// <summary>"users:SID=base64(state);SID=…" for a per-user setting, the plain state otherwise.</summary>
+        public string CaptureAll()
+        {
+            if (!Multi) return Capture();
+            using (AllUsers.Mount())
+            {
+                var parts = new List<string>();
+                foreach (var sid in AllUsers.Sids)
+                {
+                    string raw = null;
+                    try { AllUsers.With(sid, () => raw = Capture()); }
+                    catch { continue; }   // that user's settings cannot be read now: left out (and left alone)
+                    parts.Add(sid + "=" + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(raw ?? "")));
+                }
+                if (parts.Count == 0) return Capture();
+                return UsersTag + string.Join(";", parts);
+            }
+        }
+
+        /// <summary>The parts of a saved per-user state, by user; null for a plain one (older saves, machine settings).</summary>
+        static Dictionary<string, string> Split(string raw)
+        {
+            if (raw == null || !raw.StartsWith(UsersTag, StringComparison.Ordinal)) return null;
+            var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var part in raw.Substring(UsersTag.Length).Split(';'))
+            {
+                int eq = part.IndexOf('=');
+                if (eq <= 0) continue;
+                try { d[part.Substring(0, eq)] = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(part.Substring(eq + 1))); }
+                catch (FormatException) { }
+            }
+            return d;
+        }
+
+        /// <summary>
+        /// A plain saved state (the desktop user's, from before 1.7) completed with every other user's state as it
+        /// is now (still untouched); null when there is nothing to complete.
+        /// </summary>
+        public string WithAllUsers(string saved)
+        {
+            if (!Multi || Split(saved) != null) return null;
+            var d = Split(CaptureAll());
+            string me = DesktopUser.OtherSid ?? AllUsers.MySid;
+            if (d == null || !d.ContainsKey(me)) return null;
+            d[me] = saved;
+            return UsersTag + string.Join(";", d.Select(kv => kv.Key + "=" + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(kv.Value))));
+        }
+
+        /// <summary>What the person at the desktop has (or the first user's value).</summary>
+        public string ValueOfAll(string raw)
+        {
+            var d = Split(raw);
+            if (d == null) return ValueOf(raw);
+            string mine;
+            if (d.TryGetValue(DesktopUser.OtherSid ?? AllUsers.MySid, out mine)) return ValueOf(mine);
+            return d.Count > 0 ? ValueOf(d.Values.First()) : ValueOf("");
+        }
+
+        public string CurrentAll() { return ValueOfAll(CaptureAll()); }
+
+        /// <summary>Every user already has it as the target asks (one who has not makes it a change).</summary>
+        public bool AllMatch(string target) { return AllMatch(CaptureAll(), target); }
+
+        /// <summary>The same for a state already read with <see cref="CaptureAll"/>.</summary>
+        public bool AllMatch(string raw, string target)
+        {
+            var d = Split(raw);
+            if (d == null) return Matches(ValueOf(raw), target);
+            return d.Values.All(v => Matches(ValueOf(v), target));
+        }
+
+        public void SetAll(string value)
+        {
+            if (!Multi) { Set(value); return; }
+            using (AllUsers.Mount())
+            {
+                var sids = AllUsers.Sids;
+                if (sids.Count == 0) { Set(value); return; }
+                Exception first = null;
+                foreach (var sid in sids)
+                    try { AllUsers.With(sid, () => Set(value)); }
+                    catch (Exception ex) { if (first == null) first = ex; }
+                if (first != null) throw first;
+            }
+        }
+
+        /// <summary>Each user gets their own old state back; an older plain save goes to the person at the desktop.</summary>
+        public void RestoreAll(string raw)
+        {
+            var d = Split(raw);
+            if (d == null) { Restore(raw); return; }
+            using (AllUsers.Mount())
+            {
+                var present = new HashSet<string>(AllUsers.Sids, StringComparer.OrdinalIgnoreCase);
+                Exception first = null;
+                foreach (var kv in d)
+                {
+                    // An account deleted since (or whose settings cannot be loaded now): nothing to put back there.
+                    if (!present.Contains(kv.Key)) continue;
+                    string state = kv.Value;
+                    try { AllUsers.With(kv.Key, () => Restore(state)); }
+                    catch (Exception ex) { if (first == null) first = ex; }
+                }
+                if (first != null) throw first;
+            }
+        }
     }
 
     /// <summary>An on/off setting kept in one registry DWORD.</summary>
@@ -520,6 +669,7 @@ namespace DriveUp
             this.name = name;
             this.on = on;
             this.off = off;
+            PerUser = !machine;
         }
 
         public override string Capture()
@@ -596,6 +746,7 @@ namespace DriveUp
         public RegSet Add(bool machine, string path, string name, int value)
         {
             values.Add(Tuple.Create(machine, path, name, value));
+            if (!machine) PerUser = true;
             return this;
         }
 
@@ -642,6 +793,7 @@ namespace DriveUp
         public WindowedGames(string pair = "SwapEffectUpgradeEnable")
         {
             Pair = pair;
+            PerUser = true;
         }
 
         /// <summary>Only this pair: "p:value" or "p-" (not in the string). Older saves hold the whole string ("s:..." / "-").</summary>
@@ -707,7 +859,7 @@ namespace DriveUp
         public override string Capture()
         {
             if (Reg.TestRoot != null) return Convert.ToString(Reg.Get(false, "Menu", "Delay") ?? "400");
-            if (DesktopUser.Other) return Reg.Get(false, Desk, "MenuShowDelay") as string ?? "400";
+            if (Reg.TargetIsOther) return Reg.Get(false, Desk, "MenuShowDelay") as string ?? "400";
             int v = 400;
             SystemParametersInfo(0x006A /* SPI_GETMENUSHOWDELAY */, 0, ref v, 0);
             return v.ToString(CultureInfo.InvariantCulture);
@@ -722,7 +874,7 @@ namespace DriveUp
             if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out v)) return;
             if (Reg.TestRoot != null) { Reg.SetString(false, "Menu", "Delay", value); return; }
             // Elevated as another account: the desktop user's own value (applied at their next sign-in).
-            if (DesktopUser.Other) { Reg.SetString(false, Desk, "MenuShowDelay", v.ToString(CultureInfo.InvariantCulture)); return; }
+            if (Reg.TargetIsOther) { Reg.SetString(false, Desk, "MenuShowDelay", v.ToString(CultureInfo.InvariantCulture)); return; }
             if (!SystemParametersInfo(0x006B /* SPI_SETMENUSHOWDELAY */, v, IntPtr.Zero, 1 | 2)) throw new System.ComponentModel.Win32Exception();
         }
 
@@ -736,9 +888,30 @@ namespace DriveUp
 
         public override string Capture() { return Reg.Capture(true, Path, "HibernateEnabled"); }
 
-        public override void Restore(string raw) { Set(Reg.RawDword(raw) == 0 ? "0" : "1"); }
+        public override void Restore(string raw)
+        {
+            Set(ValueOf(raw));
+            // It had no value of its own: none again (Windows then goes by its default, as before).
+            if (raw == "-" && Reg.TestRoot == null) Reg.Delete(true, Path, "HibernateEnabled");
+        }
 
-        public override string ValueOf(string raw) { return Reg.RawDword(raw) == 0 ? "0" : "1"; }
+        /// <summary>
+        /// Without a HibernateEnabled value Windows goes by HibernateEnabledDefault (0 on many VMs and servers,
+        /// where it was shown as "on" and returning it ran powercfg /hibernate on).
+        /// </summary>
+        public override string ValueOf(string raw)
+        {
+            int? v = Reg.RawDword(raw);
+            if (v == null) v = Reg.Dword(true, Path, "HibernateEnabledDefault") ?? 1;
+            return v == 0 ? "0" : "1";
+        }
+
+        /// <summary>Hibernation is on now (fast startup needs it).</summary>
+        public static bool IsOn()
+        {
+            int? v = Reg.Dword(true, Path, "HibernateEnabled") ?? Reg.Dword(true, Path, "HibernateEnabledDefault");
+            return v != 0;
+        }
 
         public override void Set(string value)
         {
@@ -822,7 +995,7 @@ namespace DriveUp
                 string s = Reg.Get(false, "Mouse", "Speed") as string;
                 return (s ?? "6,10,1").Split(',').Select(int.Parse).ToArray();
             }
-            if (DesktopUser.Other)
+            if (Reg.TargetIsOther)
                 return Enumerable.Range(0, 3).Select(i =>
                 {
                     int n;
@@ -837,7 +1010,7 @@ namespace DriveUp
         {
             if (Reg.TestRoot != null) { Reg.SetString(false, "Mouse", "Speed", string.Join(",", v)); return; }
             // Elevated as another account: the desktop user's own values (applied at their next sign-in).
-            if (DesktopUser.Other)
+            if (Reg.TargetIsOther)
             {
                 for (int i = 0; i < 3; i++) Reg.SetString(false, Mouse, Names[i], v[i].ToString(CultureInfo.InvariantCulture));
                 return;
@@ -1048,7 +1221,8 @@ namespace DriveUp
                 throw new InvalidOperationException(parts[2] == "ac"
                     ? L.T("Подключите зарядку, чтобы вернуть режим питания", "Plug in the charger to return the power mode")
                     : L.T("Отключите зарядку, чтобы вернуть режим питания от батареи", "Unplug the charger to return the battery power mode"));
-            PowerApi.Activate(scheme);
+            // The old plan was deleted since: Balanced, which every Windows has, instead of failing for good.
+            PowerApi.Activate(PowerApi.Exists(scheme) ? scheme : PowerApi.Balanced);
             if (hasMode && Guid.TryParse(parts[1], out mode)) PowerApi.SetOverlay(mode);
         }
 
@@ -1077,7 +1251,10 @@ namespace DriveUp
             // On a laptop only the mains side is ever changed: on battery nothing happens.
             if (mobile && PowerApi.OnBattery)
                 throw new InvalidOperationException(L.T("Подключите зарядку: режим питания меняется только для работы от сети", "Plug in the charger: only the mains power mode is changed"));
-            if (plan != PowerApi.Balanced && !mobile && PowerApi.Exists(plan))
+            // Ryzen 9 with 3D V-Cache on one die: AMD's driver parks the other die's cores during games only under
+            // Balanced (High performance unparks every core), so "best performance" is the power mode there too.
+            bool x3d = value == "perf" && Tuner.Pc != null && Tuner.Pc.DualCcdX3D && PowerApi.HasOverlay;
+            if (plan != PowerApi.Balanced && !mobile && !x3d && PowerApi.Exists(plan))
             {
                 PowerApi.Activate(plan);
                 return;
@@ -1146,19 +1323,27 @@ namespace DriveUp
         {
             Guid active = PowerApi.Active;
             bool touched = false;
-            foreach (var entry in raw.Split(';'))
+            try
             {
-                var parts = entry.Split('|');
-                Guid scheme;
-                uint ac, dc;
-                if (parts.Length != 3 || !Guid.TryParse(parts[0], out scheme) || !uint.TryParse(parts[1], out ac) || !uint.TryParse(parts[2], out dc)) continue;
-                if (BatteryOnly) ac = PowerApi.Read(scheme, sub, setting, true);
-                else if (Battery != null && (Tuner.IsSaved(Battery.Id) || (Tuner.Pc != null && Tuner.Pc.Mobile))) dc = PowerApi.Read(scheme, sub, setting, false);
-                PowerApi.Write(scheme, sub, setting, ac, dc);
-                if (scheme == active) touched = true;
+                foreach (var entry in raw.Split(';'))
+                {
+                    var parts = entry.Split('|');
+                    Guid scheme;
+                    uint ac, dc;
+                    if (parts.Length != 3 || !Guid.TryParse(parts[0], out scheme) || !uint.TryParse(parts[1], out ac) || !uint.TryParse(parts[2], out dc)) continue;
+                    // A plan deleted since (by the user or the maker's software): nothing left to put back there.
+                    if (!PowerApi.Exists(scheme)) continue;
+                    if (BatteryOnly) ac = PowerApi.Read(scheme, sub, setting, true);
+                    else if (Battery != null && (Tuner.IsSaved(Battery.Id) || (Tuner.Pc != null && Tuner.Pc.Mobile))) dc = PowerApi.Read(scheme, sub, setting, false);
+                    PowerApi.Write(scheme, sub, setting, ac, dc);
+                    if (scheme == active) touched = true;
+                }
             }
-            // A changed plan takes effect once it is set active again.
-            if (touched) PowerApi.Activate(active);
+            finally
+            {
+                // A changed plan takes effect once it is set active again (also after a part failed).
+                if (touched) PowerApi.Activate(active);
+            }
         }
 
         /// <summary>The value in the plan that was active first (before DriveUP).</summary>

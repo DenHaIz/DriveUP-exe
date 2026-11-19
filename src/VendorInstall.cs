@@ -175,8 +175,16 @@ namespace DriveUp
             signer = null;
             error = null;
             if (!Offers(v)) { error = L.T("для этой находки нет файла — только страница", "no file for this finding — only its page"); return null; }
-            string dir = InfFiles.NewDownloadDir();
             string name = FileName(v.FileUrl);
+            // Only installers and archives: a signed .msi (or anything else) saved as setup.exe passed the checks and
+            // then failed to start ("not a valid Win32 application").
+            string ext = Path.GetExtension(name ?? "").ToLowerInvariant();
+            if (Array.IndexOf(new[] { ".msi", ".msp", ".msu", ".cab", ".7z", ".rar", ".iso", ".img", ".bin", ".pdf", ".txt", ".htm", ".html" }, ext) >= 0)
+            {
+                error = L.T("файл формата «" + ext + "» DriveUP не устанавливает — откройте страницу производителя", "DriveUP does not install " + ext + " files — open the vendor's page");
+                return null;
+            }
+            string dir = InfFiles.NewDownloadDir();
             if (!Regex.IsMatch(name, @"^[\w.\-]+\.(exe|zip)$", RegexOptions.IgnoreCase)) name = IsZip(name) ? "package.zip" : "setup.exe";
             string file = Path.Combine(dir, name);
             try

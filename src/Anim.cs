@@ -70,6 +70,32 @@ namespace DriveUp
             Add(new Tween { Key = key, Frame = frame });
         }
 
+        /// <summary>
+        /// Moves a value to a target that may keep changing on the way (wheel scrolling), as a critically damped
+        /// spring: the speed carries over when the target moves, so fast wheel turns glide instead of surging and
+        /// stopping on every notch as a restarted tween did. Called again while running, it just follows the new target.
+        /// </summary>
+        public static void Follow(object key, Func<float> value, Action<float> set, Func<float> target, float omega = 24f)
+        {
+            Tween running;
+            if (byKey.TryGetValue(key, out running) && running.Frame != null && !running.Dead) return;
+            double last = -1;
+            float v = 0;
+            Frame(key, () =>
+            {
+                double now = FrameNow;
+                float dt = last < 0 ? (float)(FramePeriod / 1000) : (float)Math.Max(0, Math.Min(0.05, (now - last) / 1000));
+                last = now;
+                // Exact step of x'' = -w²x - 2wx' over dt.
+                float x = value() - target(), tmp = (v + omega * x) * dt, e = (float)Math.Exp(-omega * dt);
+                float nx = (x + tmp) * e;
+                v = (v - omega * tmp) * e;
+                if (Math.Abs(nx) < 0.5f && Math.Abs(v) < 20) { set(target()); return false; }
+                set(target() + nx);
+                return true;
+            });
+        }
+
         /// <summary>Runs action after ms milliseconds, on the animation clock.</summary>
         public static void Delay(int ms, Action action)
         {
@@ -123,6 +149,7 @@ namespace DriveUp
             lastFrame = now;
             RunTweens(now);
             PaintNow();
+            hidden = NothingOnScreen();
             if (FrameLog != null) Log(string.Format(System.Globalization.CultureInfo.InvariantCulture,
                 "F\t{0:F1}\t{1:F1}\t{2:F1}\t{3}", now, began - now, Now - began, tweens.Count));
         }
@@ -154,6 +181,16 @@ namespace DriveUp
         /// frame is already queued before Windows gets to it, so a control that only invalidates (the tab
         /// underline) stood still for several frames and then jumped. Painting here keeps every animation in step.
         /// </summary>
+        /// <summary>Every window minimized or hidden: the clock then ticks a few times a second, not at the display rate.</summary>
+        static volatile bool hidden;
+
+        static bool NothingOnScreen()
+        {
+            foreach (Form f in Application.OpenForms)
+                if (f.Visible && f.WindowState != FormWindowState.Minimized) return false;
+            return true;
+        }
+
         static void PaintNow()
         {
             if (Application.OpenForms.Count == 0) return;
@@ -255,7 +292,13 @@ namespace DriveUp
                 long vblank, period;
                 // Remote sessions report a ~30 Hz composition clock that RDP re-samples anyway;
                 // there an even 60 Hz cadence looks smoother than following DWM.
-                if (!remote && TryVBlank(out vblank, out period) && period <= Stopwatch.Frequency / 50)
+                if (hidden)
+                {
+                    // Nothing to see (minimized): spinners and loaders only need to stay in time, ~8 ticks a second.
+                    period = Stopwatch.Frequency / 8;
+                    if (next <= now) next = now + period;
+                }
+                else if (!remote && TryVBlank(out vblank, out period) && period <= Stopwatch.Frequency / 50)
                 {
                     // Fire just after each vblank: the frame then has a whole refresh interval to paint.
                     long offset = (long)TicksPerMs;
@@ -278,12 +321,13 @@ namespace DriveUp
 
         static void WaitUntil(long stamp)
         {
+            // Sleeps only (1 ms timer resolution): the frame is drawn for its scheduled time anyway, so waking up to
+            // a millisecond early costs nothing, while spinning out the last 1.5 ms took ~9 % of a core all along.
             while (true)
             {
                 double ms = (stamp - Stopwatch.GetTimestamp()) / TicksPerMs;
-                if (ms <= 0) return;
-                if (ms > 2) Thread.Sleep((int)(ms - 1.5));
-                else Thread.Yield();
+                if (ms <= 1) return;
+                Thread.Sleep(Math.Max(1, (int)(ms - 0.5)));
             }
         }
 
@@ -320,6 +364,27 @@ namespace DriveUp
         public static float Lerp(float a, float b, float t)
         {
             return a + (b - a) * t;
+        }
+
+        /// <summary>
+        /// Whether a control is on screen now: visible, with its window not minimized. Continuous animations
+        /// (spinners, loaders) repaint only then — a minimized window kept repainting them for a whole scan.
+        /// </summary>
+        public static bool Shown(Control c)
+        {
+            if (c == null || c.IsDisposed || !c.Visible || !c.IsHandleCreated) return false;
+            var f = c.FindForm();
+            return f == null || f.WindowState != FormWindowState.Minimized;
+        }
+
+        /// <summary>
+        /// Two texts that differ only in their numbers ("Install (3)" / "Install (4)", "1 of 5" / "2 of 5"):
+        /// a counter, which just changes — fading it out and back in on every tick read as blinking.
+        /// </summary>
+        public static bool OnlyNumbersDiffer(string a, string b)
+        {
+            if (a == null || b == null || a.Length == 0 || b.Length == 0) return false;
+            return System.Text.RegularExpressions.Regex.Replace(a, @"[\d\s.,]+", "#") == System.Text.RegularExpressions.Regex.Replace(b, @"[\d\s.,]+", "#");
         }
     }
 

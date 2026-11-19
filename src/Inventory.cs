@@ -133,7 +133,16 @@ namespace DriveUp
         /// <summary>Turned off by an organisation's policy: nothing DriveUP should change.</summary>
         static bool OffByPolicy
         {
-            get { return Convert.ToInt32(Machine(Policy, "DisableSR") ?? 0) == 1 || Convert.ToInt32(Machine(Policy, "DisableConfig") ?? 0) == 1; }
+            get { return Int(Machine(Policy, "DisableSR"), 0) == 1 || Int(Machine(Policy, "DisableConfig"), 0) == 1; }
+        }
+
+        /// <summary>A registry number of any kind ("1", binary...) without throwing: an odd value ended the install thread and DriveUP.</summary>
+        static int Int(object v, int fallback)
+        {
+            if (v == null) return fallback;
+            if (v is int) return (int)v;
+            int n;
+            return int.TryParse(Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out n) ? n : fallback;
         }
 
         /// <summary>System Protection is known to be off for the system drive (false when it is on or cannot be told).</summary>
@@ -163,7 +172,7 @@ namespace DriveUp
 
         static bool ServiceDisabled(string name)
         {
-            return Convert.ToInt32(Machine(@"SYSTEM\CurrentControlSet\Services\" + name, "Start") ?? 3) == 4;
+            return Int(Machine(@"SYSTEM\CurrentControlSet\Services\" + name, "Start"), 3) == 4;
         }
 
         /// <summary>A failure in words, with the code to look up when it is not a known one.</summary>

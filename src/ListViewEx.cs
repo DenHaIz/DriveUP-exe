@@ -480,7 +480,7 @@ namespace DriveUp
                     if (t >= 1) { flash.Remove(it); flashColor.Remove(it); }
                     else flash[it] = 1 - t;
                     InvalidateRow(it);
-                }, null, t => t * t);
+                }, null, t => t >= 1 ? 1 : Anim.SineInOut(t));   // eases out at the end too (t² snapped off)
             }
         }
 

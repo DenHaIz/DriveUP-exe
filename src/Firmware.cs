@@ -46,7 +46,8 @@ namespace DriveUp
         public static string PowerProblem()
         {
             var ps = SystemInformation.PowerStatus;
-            if ((ps.BatteryChargeStatus & BatteryChargeStatus.NoSystemBattery) != 0) return null;
+            // "Unknown" (255) has every bit set, the no-battery one too: a battery Windows cannot read is still a battery.
+            if (ps.BatteryChargeStatus != BatteryChargeStatus.Unknown && (ps.BatteryChargeStatus & BatteryChargeStatus.NoSystemBattery) != 0) return null;
             if (ps.PowerLineStatus != PowerLineStatus.Online)
                 return L.T("Ноутбук работает от батареи. Прошивка устанавливается при перезагрузке и без зарядного устройства не запустится — " +
                            "ноутбук остановится на экране «Please plug in AC Adapter». Подключите зарядку.",

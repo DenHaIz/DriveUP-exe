@@ -22,7 +22,7 @@ namespace DriveUp
         bool busy;
         readonly Tweened hover, drag, pulse, busyT;
         readonly System.Windows.Forms.Timer watch = new System.Windows.Forms.Timer { Interval = 50 };
-        readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
+        readonly double born = Anim.Now;
         readonly object frameKey = new object();
         bool animating;
         float dashPhase;
@@ -148,7 +148,7 @@ namespace DriveUp
             Anim.Frame(frameKey, () =>
             {
                 if (IsDisposed) return animating = false;
-                if (Visible) Invalidate();
+                if (Anim.Shown(this)) Invalidate();
                 animating = busy || drag.Value > 0.01f || busyT.Value > 0.01f;
                 return animating;
             });
@@ -166,19 +166,23 @@ namespace DriveUp
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
             float h = Math.Max(hover.Value * 0.5f, drag.Value), pl = pulse.Value, bt = busyT.Value;
-            float sec = clock.ElapsedMilliseconds / 1000f;
+            // The display frame's time (not a stopwatch read whenever the paint runs): the spinner turns evenly.
+            float sec = (float)((Anim.FrameNow - born) / 1000);
 
             var r = new RectangleF(S(1), S(1), Width - S(2) - 1, Height - S(2) - 1);
             Theme.FillRoundFast(g, Anim.Blend(Anim.Blend(p.Surface, p.Accent, 0.05f * h + 0.08f * pl), bg, 0), r, S(12));
+            float baseW = Math.Max(1.2f, S(2) * 0.75f), pw = Math.Max(1.2f, S(2) * (0.75f + 0.25f * h));
+            // Dash lengths are in pen widths: kept the same in pixels while the line thickens on hover (they crawled).
+            float unit = baseW / pw;
             using (var path = Theme.RoundRect(r, S(12)))
-            using (var pen = new Pen(Anim.Blend(Anim.Blend(p.Border, p.TextDim, 0.35f), p.Accent, Math.Max(h, pl)), Math.Max(1.2f, S(2) * (0.75f + 0.25f * h)))
-                   { DashStyle = DashStyle.Custom, DashPattern = new[] { 4f, 3f } })
+            using (var pen = new Pen(Anim.Blend(Anim.Blend(p.Border, p.TextDim, 0.35f), p.Accent, Math.Max(h, pl)), pw)
+                   { DashStyle = DashStyle.Custom, DashPattern = new[] { 4f * unit, 3f * unit } })
             {
                 // The dashes creep along the border while a drag hovers over the area (and simply stop after).
-                double now = clock.Elapsed.TotalSeconds;
-                dashPhase -= (float)Math.Min(0.1, now - lastPaint) * 6f * drag.Value;
+                double now = sec;
+                dashPhase -= (float)Math.Max(0, Math.Min(0.1, now - lastPaint)) * 6f * drag.Value;
                 lastPaint = now;
-                pen.DashOffset = dashPhase % 7f;
+                pen.DashOffset = (dashPhase % 7f) * unit;
                 g.DrawPath(pen, path);
             }
 

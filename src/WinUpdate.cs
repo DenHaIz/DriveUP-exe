@@ -117,6 +117,48 @@ namespace DriveUp
         }
 
         /// <summary>
+        /// Watches a download or install job: no move at all for too long, the whole thing far too long, or no end a
+        /// minute after "stop" was asked — then it is given up (asked to abort, and left behind: after RequestAbort the
+        /// agent's End calls can block for good). Before, a stuck agent kept the ring spinning and the window open forever.
+        /// </summary>
+        class Stall
+        {
+            readonly TimeSpan still, limit;
+            readonly DateTime started = DateTime.UtcNow;
+            DateTime moved = DateTime.UtcNow, abortAt = DateTime.MinValue;
+            string last;
+
+            public Stall(TimeSpan still, TimeSpan limit)
+            {
+                this.still = still;
+                this.limit = limit;
+            }
+
+            public void Saw(string state)
+            {
+                if (state == last) return;
+                last = state;
+                moved = DateTime.UtcNow;
+            }
+
+            public void Check(dynamic job, string what)
+            {
+                var now = DateTime.UtcNow;
+                if (abort)
+                {
+                    if (abortAt == DateTime.MinValue) abortAt = now;
+                    else if (now - abortAt > TimeSpan.FromSeconds(60)) throw Cancelled();
+                    return;
+                }
+                if (now - moved < still && now - started < limit) return;
+                try { job.RequestAbort(); } catch { }
+                throw new TimeoutException(string.Format(L.T("Windows Update завис: {0} не продвигается {1} мин — перезагрузите компьютер и попробуйте снова",
+                                                             "Windows Update is stuck: {0} has not moved for {1} min — restart the PC and try again"),
+                    what, (int)Math.Round((now - (now - started >= limit ? started : moved)).TotalMinutes)));
+            }
+        }
+
+        /// <summary>
         /// Takes from half a minute to a few minutes, at most SearchLimit. The agent is called on a worker thread
         /// that is simply left behind at the limit: after RequestAbort even EndSearch and CleanUp can block for good.
         /// </summary>
@@ -145,21 +187,25 @@ namespace DriveUp
         static List<DriverUpdate> SearchNow(SearchRun run)
         {
             dynamic session = NewSession();
-            dynamic result;
+            dynamic searcher = session.CreateUpdateSearcher();
+            searcher.Online = true;
+            var cb = new WuCallbacks();
+            dynamic job;
             try
             {
-                dynamic searcher = session.CreateUpdateSearcher();
-                searcher.Online = true;
                 searcher.ServerSelection = 2;   // ssWindowsUpdate
-                result = SearchAsync(searcher, run);
+                job = searcher.BeginSearch(Criteria, cb, null);
             }
             catch (COMException)
             {
-                // Policy may forbid going to Windows Update directly: use whatever this PC is set up for.
-                dynamic searcher = session.CreateUpdateSearcher();
+                // Policy may forbid going to Windows Update directly: use whatever this PC is set up for. Only the
+                // setting-up falls back — a network or agent error during the search itself is reported as such
+                // (searching again on a WSUS server, which has no drivers, said "all up to date").
+                searcher = session.CreateUpdateSearcher();
                 searcher.Online = true;
-                result = SearchAsync(searcher, run);
+                job = searcher.BeginSearch(Criteria, cb, null);
             }
+            dynamic result = SearchAsync(searcher, job, run);
             if (result == null) return null;   // given up: nobody waits for it any more
 
             // 4 = failed, 5 = aborted: not the same as "nothing found".
@@ -192,10 +238,8 @@ namespace DriveUp
         }
 
         /// <summary>The search as a job, so that it can be aborted when the caller gives up (null then).</summary>
-        static dynamic SearchAsync(dynamic searcher, SearchRun run)
+        static dynamic SearchAsync(dynamic searcher, dynamic job, SearchRun run)
         {
-            var cb = new WuCallbacks();
-            dynamic job = searcher.BeginSearch(Criteria, cb, null);
             while (!(bool)job.IsCompleted)
             {
                 if (run.GiveUp)
@@ -258,15 +302,19 @@ namespace DriveUp
             }
             if (job != null)
             {
+                var watch = new Stall(TimeSpan.FromMinutes(20), TimeSpan.FromHours(3));
                 while (!(bool)job.IsCompleted)
                 {
                     if (abort) { try { job.RequestAbort(); } catch { } }
                     try
                     {
                         dynamic pr = job.GetProgress();
-                        progress(0, (int)pr.PercentComplete / 100f, (int)pr.CurrentUpdateIndex);
+                        int pct = (int)pr.PercentComplete, idx = (int)pr.CurrentUpdateIndex;
+                        progress(0, pct / 100f, idx);
+                        watch.Saw(pct + "|" + idx + "|" + Convert.ToInt64(pr.TotalBytesDownloaded));
                     }
                     catch { }
+                    watch.Check(job, L.T("скачивание", "the download"));
                     Thread.Sleep(150);
                 }
                 dres = downloader.EndDownload(job);
@@ -312,16 +360,20 @@ namespace DriveUp
             }
             if (ijob != null)
             {
+                // A big graphics driver can sit on one step for many minutes: only half an hour without any move counts as stuck.
+                var watch = new Stall(TimeSpan.FromMinutes(30), TimeSpan.FromHours(3));
                 while (!(bool)ijob.IsCompleted)
                 {
                     if (abort) { try { ijob.RequestAbort(); } catch { } }
                     try
                     {
                         dynamic pr = ijob.GetProgress();
-                        int idx = (int)pr.CurrentUpdateIndex;
-                        progress(1, (int)pr.PercentComplete / 100f, updates.IndexOf(installing[Math.Max(0, Math.Min(installing.Count - 1, idx))]));
+                        int idx = (int)pr.CurrentUpdateIndex, pct = (int)pr.PercentComplete;
+                        progress(1, pct / 100f, updates.IndexOf(installing[Math.Max(0, Math.Min(installing.Count - 1, idx))]));
+                        watch.Saw(pct + "|" + idx + "|" + (int)pr.CurrentUpdatePercentComplete);
                     }
                     catch { }
+                    watch.Check(ijob, L.T("установка", "the installation"));
                     Thread.Sleep(150);
                 }
                 ires = installer.EndInstall(ijob);

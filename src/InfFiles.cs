@@ -193,14 +193,28 @@ namespace DriveUp
                     string copy;
                     if (!copies.TryGetValue(dir, out copy))
                     {
-                        // Up to 4 GB / 20 000 files (a whole Downloads folder is not copied: checked in place).
+                        // Up to 4 GB / 20 000 files.
                         copy = SafePath.StageCopy(dir, 4L << 30, 20000);
                         if (copy != null) lock (tempDirs) tempDirs.Add(copy);
                         copies[dir] = copy;
                     }
-                    if (copy != null) path = System.IO.Path.Combine(copy, System.IO.Path.GetFileName(path));
+                    // Never installed in place: in a folder the user can write, the .inf and its catalog could be swapped
+                    // for another signed package between the check below and the install.
+                    if (copy == null)
+                    {
+                        error = L.T("Папка с драйвером слишком большая (больше 4 ГБ или 20 000 файлов) — распакуйте драйвер в отдельную папку и добавьте её",
+                                    "The driver's folder is too large (over 4 GB or 20,000 files) — unpack the driver into a folder of its own and add that");
+                        return null;
+                    }
+                    path = System.IO.Path.Combine(copy, System.IO.Path.GetFileName(path));
                 }
-                if (d.Hash.Length > 0 && SafePath.Sha256(path) != d.Hash)
+                // The .inf must be the one read when it was added; one that could not be read then is not installed blind.
+                if (d.Hash.Length == 0)
+                {
+                    error = L.T("Файл драйвера не удалось прочитать при добавлении — добавьте его снова", "The driver file could not be read when it was added — add it again");
+                    return null;
+                }
+                if (SafePath.Sha256(path) != d.Hash)
                 {
                     error = L.T("Файл драйвера изменился после добавления — добавьте его снова", "The driver file changed after it was added — add it again");
                     return null;

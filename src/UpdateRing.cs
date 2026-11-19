@@ -38,6 +38,17 @@ namespace DriveUp
         Func<float, float> travelEase = Anim.EaseInOut;
         float lastStart = Logo.SolidStart, lastSweep;
         float warn, centerFade = 1, popIn = 1, prevPop = 1, progress, shownNumber, capFade = 1;
+        // Installing: the progress shown follows the reported one frame by frame (restarting a tween on every
+        // report — several a second — reset its speed each time and the arc moved in jerks); the glint runs on
+        // its own position, not one computed from the arc's length, so a longer arc never makes it jump back.
+        float progressTarget, glintPos;
+        float lastStep = -1;
+        // The arc's speed as drawn (°/s), so a spinning arc that settles keeps its speed and brakes from it
+        // (a plain ease started it at a speed of its own: it braked hard or sped up first).
+        float startVel, sweepVel, velSec = -1, velStart, velSweep;
+        bool hermite;
+        float m0Start, m0Sweep;
+        Center prevKind = Center.Logo;
         string caption = "", prevCaption = "";
         readonly Tweened hover, press;
         readonly object frameKey = new object(), numKey = new object(), travelKey = new object(), progKey = new object(),
@@ -107,15 +118,28 @@ namespace DriveUp
         public string Caption
         {
             get { return caption; }
-            set
+            set { SetCaption(value, true); }
+        }
+
+        /// <summary>
+        /// A new caption; without <paramref name="fade"/> it simply replaces the old one (a counter going
+        /// "1 of 5" → "2 of 5" must not blink out and back in).
+        /// </summary>
+        public void SetCaption(string value, bool fade)
+        {
+            value = value ?? "";
+            if (value == caption) return;
+            if (!fade)
             {
-                value = value ?? "";
-                if (value == caption) return;
-                prevCaption = capFade > 0.5f ? caption : prevCaption;
+                // A fade under way just carries on, now towards the new text.
                 caption = value;
-                capFade = 0;
-                Anim.Run(capKey, 320, t => { capFade = t; Invalidate(); });
+                Invalidate();
+                return;
             }
+            prevCaption = capFade > 0.5f ? caption : prevCaption;
+            caption = value;
+            capFade = 0;
+            Anim.Run(capKey, 320, t => { capFade = t; Invalidate(); });
         }
 
         public void SetState(RingState s)
@@ -135,11 +159,18 @@ namespace DriveUp
             int ms;
             if (prevState == RingState.Scanning && s != RingState.Scanning)
             {
+                // A spinning arc slows down into place from the speed it has (Hermite: that speed at the start,
+                // at rest at the end), far enough ahead that it never has to turn back.
                 ms = 1000;
-                travelEase = EaseOutCubic;   // a spinning arc slows down into place
+                hermite = true;
+                m0Start = Math.Max(0, startVel) * ms / 1000f;
+                m0Sweep = sweepVel * ms / 1000f;
+                while (targetStart + startOffset - fromStart < m0Start / 3) startOffset += 360;
+                travelEase = x => x;
             }
             else
             {
+                hermite = false;
                 ms = s == RingState.Scanning ? 650 : (s == RingState.Working ? 550 : 850);
                 travelEase = Anim.EaseInOut;
             }
@@ -150,10 +181,26 @@ namespace DriveUp
             if (Math.Abs(wFrom - wTo) > 0.001f) Anim.Run(warnKey, 500, t => { warn = Anim.Lerp(wFrom, wTo, t); Invalidate(); });
 
             prevPop = popIn;
-            if (Kind(prevState) != Kind(s))
+            Center shownKind = Kind(prevState), newKind = Kind(s);
+            if (shownKind != newKind)
             {
-                centerFade = 0;
-                Anim.Run(fadeKey, 380, t => { centerFade = t; Invalidate(); });
+                if (centerFade < 0.4f && newKind != prevKind)
+                {
+                    // Changed again before the incoming picture showed at all: the outgoing one just goes on fading
+                    // (restarting would pop it back to full).
+                }
+                else if (centerFade < 1 && newKind == prevKind)
+                {
+                    // Back to what was fading out: it fades in again from where it is.
+                    Anim.Cancel(fadeKey);
+                    centerFade = 1;
+                }
+                else
+                {
+                    prevKind = shownKind;
+                    centerFade = 0;
+                    Anim.Run(fadeKey, 380, t => { centerFade = t; Invalidate(); });
+                }
             }
             if (s == RingState.UpToDate || s == RingState.Done || s == RingState.Error)
             {
@@ -163,17 +210,20 @@ namespace DriveUp
             if (s == RingState.Working && prevState != RingState.Working)
             {
                 Anim.Cancel(progKey);
-                progress = 0;
+                progress = progressTarget = 0;
+                glintPos = 0;
             }
 
             bool needsFrames = s == RingState.Scanning || s == RingState.Working;
             if (needsFrames && !running)
             {
                 running = true;
+                lastStep = -1;
                 Anim.Frame(frameKey, () =>
                 {
                     if (IsDisposed) return running = false;
-                    if (Visible) Invalidate();
+                    Step();
+                    if (Anim.Shown(this)) Invalidate();
                     running = state == RingState.Scanning || state == RingState.Working;
                     return running;
                 });
@@ -186,11 +236,12 @@ namespace DriveUp
             return (float)(0.5 - 0.5 * Math.Cos(Math.PI * Math.Max(0, Math.Min(1, t))));
         }
 
-        static float EaseOutCubic(float t)
+        /// <summary>From p0 moving at m0 (distance per whole travel) to p1 at rest, t 0..1.</summary>
+        static float Hermite(float p0, float p1, float m0, float t)
         {
             t = Math.Max(0, Math.Min(1, t));
-            float u = 1 - t;
-            return 1 - u * u * u;
+            float t2 = t * t, t3 = t2 * t;
+            return (2 * t3 - 3 * t2 + 1) * p0 + (t3 - 2 * t2 + t) * m0 + (-2 * t3 + 3 * t2) * p1;
         }
 
         /// <summary>Overshooting ease for the "pop".</summary>
@@ -265,11 +316,34 @@ namespace DriveUp
         /// <summary>Installation progress 0..1; the arc glides to it (it never moves backwards).</summary>
         public void SetProgress(float value)
         {
-            value = Math.Max(progress, Math.Max(0, Math.Min(1, value)));
-            float from = progress;
-            if (Math.Abs(value - from) < 0.0005f) return;
-            Anim.Run(progKey, 320, t => { progress = from + (value - from) * t; Invalidate(); });
+            value = Math.Max(0, Math.Min(1, value));
+            if (value <= progressTarget) return;
+            progressTarget = value;
+            // No frames running (not installing): shown as it is.
+            if (!running) { progress = value; Invalidate(); }
         }
+
+        /// <summary>Once per display frame while frames run: the progress and the glint move by the frame's time.</summary>
+        void Step()
+        {
+            float now = Sec;
+            float dt = lastStep < 0 ? 0 : Math.Max(0, Math.Min(0.1f, now - lastStep));
+            lastStep = now;
+            if (state != RingState.Working) return;
+            if (progress < progressTarget)
+            {
+                // Eases towards the reported value: quick after a big step, never past it, never stop-and-go;
+                // a little minimum speed so the last fraction does not crawl.
+                progress += (progressTarget - progress) * (1 - (float)Math.Exp(-dt / 0.3f));
+                progress = Math.Min(progressTarget, progress + dt * 0.02f);
+            }
+            // Glint: along the filled arc and its length again as a pause, then from the start.
+            float cycle = lastSweep + GlintLen + 120;
+            glintPos += dt * 190;
+            if (glintPos > cycle) glintPos %= cycle;
+        }
+
+        const float GlintLen = 46;
 
         protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); if (Clickable) hover.To(1, 140); }
         protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover.To(0, 260); press.To(0, 160); }
@@ -310,14 +384,38 @@ namespace DriveUp
             // ----- the arc -----
             float ts, tw;
             Target(state, sec, out ts, out tw);
-            float start = Anim.Lerp(fromStart, ts + startOffset, travel);
-            float sweep = Math.Max(0, Anim.Lerp(fromSweep, tw, travel));
+            float start, sweep;
+            if (hermite)
+            {
+                start = Hermite(fromStart, ts + startOffset, m0Start, travel);
+                sweep = Math.Max(0, Math.Min(360, Hermite(fromSweep, tw, m0Sweep, travel)));
+            }
+            else
+            {
+                start = Anim.Lerp(fromStart, ts + startOffset, travel);
+                sweep = Math.Max(0, Anim.Lerp(fromSweep, tw, travel));
+            }
             if (travel >= 1)
             {
                 // Settled: forget the extra turns so the numbers stay small.
                 startOffset = 0;
                 start = ts;
+                sweep = Math.Max(0, tw);
+                hermite = false;
             }
+            // The speed as drawn, for a settle that keeps it (turns taken off count as nothing).
+            float dtv = sec - velSec;
+            if (dtv > 0.004f && dtv < 0.2f)
+            {
+                float ds = start - velStart;
+                ds -= 360f * (float)Math.Round(ds / 360f);
+                startVel = ds / dtv;
+                sweepVel = (sweep - velSweep) / dtv;
+            }
+            else if (dtv >= 0.2f) startVel = sweepVel = 0;
+            velSec = sec;
+            velStart = start;
+            velSweep = sweep;
             lastStart = start % 360f;
             if (lastStart < 0) lastStart += 360;
             lastSweep = sweep;
@@ -332,9 +430,9 @@ namespace DriveUp
             if (state == RingState.Working && sweep > 12)
             {
                 float capDeg = (float)(stroke / 2 / radius * 180 / Math.PI);
-                const float len = 46;
+                const float len = GlintLen;
                 float span = sweep + len;
-                float head = ((sec * 190) % (span + 120)) - 0;
+                float head = glintPos;
                 float a0 = Math.Max(start + capDeg, start + head - len), a1 = Math.Min(start + sweep - capDeg, start + head);
                 if (a1 - a0 > 0.5f)
                 {
@@ -355,8 +453,8 @@ namespace DriveUp
             float shift = S(8);
             // Out, then in (a little overlap): two pictures or numbers never sit on top of each other.
             float outA = 1 - Smooth(0, 0.55f, centerFade), inA = Smooth(0.4f, 1, centerFade);
-            if (centerFade < 1 && Kind(prevState) != Kind(state))
-                DrawCenter(g, Kind(prevState), OffsetY(pic, -shift * centerFade), outA, bg, inner, lw, sec, prevPop);
+            if (centerFade < 1 && prevKind != Kind(state))
+                DrawCenter(g, prevKind,OffsetY(pic, -shift * centerFade), outA, bg, inner, lw, sec, prevPop);
             DrawCenter(g, Kind(state), OffsetY(pic, shift * (1 - centerFade)), inA, bg, inner, lw, sec, popIn);
 
             int innerW = (int)(radius * 2 - stroke * 2);

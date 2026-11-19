@@ -112,7 +112,8 @@ namespace DriveUp
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            if (!closingDone)
+            // Windows restarting or shutting down: closed at once (held open, it blocked the restart).
+            if (!closingDone && e.CloseReason != CloseReason.WindowsShutDown && e.CloseReason != CloseReason.TaskManagerClosing)
             {
                 e.Cancel = true;
                 Finish(DialogResult.Cancel);

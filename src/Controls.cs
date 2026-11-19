@@ -153,9 +153,12 @@ namespace DriveUp
         {
             base.OnTextChanged(e);
             // A visible button cross-fades its caption ("Check" → "Install (3)"); a hidden one just changes.
-            if (Visible && IsHandleCreated && shownText.Length > 0 && Text.Length > 0)
+            // "Install (3)" → "(4)" on a tick of a box: just changes (a fade under way carries on to it).
+            if (Anim.OnlyNumbersDiffer(shownText, Text)) { }
+            else if (Visible && IsHandleCreated && shownText.Length > 0 && Text.Length > 0)
             {
-                oldText = shownText;
+                // Mid-fade the button still mostly shows the old caption: that one keeps fading out.
+                if (textFade >= 0.5f) oldText = shownText;
                 textFade = 0;
                 Anim.Run(textKey, 220, t => { textFade = t; Invalidate(); });
             }
@@ -235,7 +238,10 @@ namespace DriveUp
                 {
                     // Old caption slides up and out, the new one comes up from below.
                     int dy = (int)Math.Round(S(6) * textFade);
-                    TextDraw.DrawText(g, oldText, Font, new Rectangle(tr.X, tr.Y - dy, tr.Width, tr.Height), Anim.Blend(bg, fg, 1 - textFade), TextLeft);
+                    // Each caption centred by its own width (the old one placed by the new width jumped sideways).
+                    int ox = tr.X + (MeasureWidth(Text, Font) - MeasureWidth(oldText, Font)) / 2;
+                    if (Math.Max(S(12), (Width - content) / 2) == S(12)) ox = tr.X;
+                    TextDraw.DrawText(g, oldText, Font, new Rectangle(ox, tr.Y - dy, Width - ox - S(4), tr.Height), Anim.Blend(bg, fg, 1 - textFade), TextLeft);
                     TextDraw.DrawText(g, Text, Font, new Rectangle(tr.X, tr.Y + S(6) - dy, tr.Width, tr.Height), Anim.Blend(bg, fg, textFade), TextLeft);
                 }
                 else TextDraw.DrawText(g, Text, Font, tr, fg, TextLeft);
@@ -820,7 +826,7 @@ namespace DriveUp
             Anim.Frame(frameKey, () =>
             {
                 if (IsDisposed) return false;
-                if (Visible) Invalidate();
+                if (Anim.Shown(this)) Invalidate();
                 return active || alpha.Value > 0.01f;
             });
         }

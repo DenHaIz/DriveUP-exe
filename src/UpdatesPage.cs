@@ -370,7 +370,12 @@ namespace DriveUp
             {
                 Dictionary<string, Bitmap> icons;
                 var devs = Inventory.LoadDevices(out icons);
-                Post(() => { if (!Inventory.DevicesLoaded) Inventory.SetDevices(devs, icons); });
+                Post(() =>
+                {
+                    if (!Inventory.DevicesLoaded) Inventory.SetDevices(devs, icons);
+                    // The Devices tab got there first: these icons (about 150 bitmaps) are nobody's.
+                    else if (icons != null) foreach (var b in icons.Values) if (b != null) b.Dispose();
+                });
             }) { IsBackground = true, Priority = ThreadPriority.BelowNormal };
             th.Start();
         }
@@ -422,20 +427,21 @@ namespace DriveUp
                 try { found = WinUpdate.Search(); }
                 catch (Exception ex) { err = WinUpdate.ErrorText(ex); }
                 // A little longer than the vendor check's own limit (40 s): its partial results still arrive.
+                var rts = ReadRuntimes();
                 vt.Join(46000);
-                RunUI(() => CheckDone(found, err, vendors ?? new List<VendorUpdate>(), pc));
+                RunUI(() => CheckDone(found, err, vendors ?? new List<VendorUpdate>(), pc, rts));
             }) { IsBackground = true };
             th.SetApartmentState(ApartmentState.MTA);
             th.Start();
         }
 
-        void CheckDone(List<DriverUpdate> found, string err, List<VendorUpdate> vendors, PcInfo pc)
+        void CheckDone(List<DriverUpdate> found, string err, List<VendorUpdate> vendors, PcInfo pc, List<KeyValuePair<Runtime, bool>> runtimes)
         {
             scanning = false;
             stageTimer.Stop();
             Host.EndBusy();
             checkedOnce = true;
-            vendorCats = VendorGroups(vendors).Concat(RuntimeGroups()).ToList();
+            vendorCats = VendorGroups(vendors).Concat(RuntimeGroups(runtimes)).ToList();
             if (found == null)
             {
                 failedCheck = true;
@@ -705,11 +711,26 @@ namespace DriveUp
         /// Libraries programs and games need that are missing here: one row each, plus "install all".
         /// Official Microsoft downloads, run only when signed by Microsoft (see Runtimes).
         /// </summary>
-        List<CatGroup> RuntimeGroups()
+        /// <summary>
+        /// What is missing, each with "an old version is there". Reads the whole Uninstall list: off the UI thread
+        /// (on it the search spinner froze just as it began to settle).
+        /// </summary>
+        static List<KeyValuePair<Runtime, bool>> ReadRuntimes()
         {
             List<Runtime> missing;
             try { missing = Runtimes.Missing(); }
             catch { missing = new List<Runtime>(); }
+            return missing.Select(r =>
+            {
+                bool old = false;
+                try { old = r.Installed(); } catch { }
+                return new KeyValuePair<Runtime, bool>(r, old);
+            }).ToList();
+        }
+
+        List<CatGroup> RuntimeGroups(List<KeyValuePair<Runtime, bool>> found)
+        {
+            var missing = found.Select(x => x.Key).ToList();
             if (missing.Count == 0) return new List<CatGroup>();
             var g = new CatGroup
             {
@@ -726,11 +747,10 @@ namespace DriveUp
                     Note = () => string.Join(", ", missing.Select(r => r.Name)),
                     Open = () => InstallRuntimes(missing),
                 });
-            foreach (var r in missing)
+            foreach (var r in found)
             {
-                var rt = r;
-                bool old = false;
-                try { old = rt.Installed(); } catch { }
+                var rt = r.Key;
+                bool old = r.Value;
                 g.Items.Add(new CatItem
                 {
                     Size = 0, Badge = old ? L.T("обновить", "update") : L.T("установить", "install"),
@@ -751,11 +771,20 @@ namespace DriveUp
                 if (errors.Count == 0) Host.ShowToast(L.T("Установлено компонентов: ", "Components installed: ") + ok, ToastKind.Success);
                 else Host.ShowToast(string.Join("\n", errors.Take(3)), ok > 0 ? ToastKind.Info : ToastKind.Error);
                 // What is still missing.
-                vendorCats = vendorCats.Where(x => !"runtimes".Equals(x.Tag)).Concat(RuntimeGroups()).ToList();
-                var shown = cats.Concat(vendorCats).ToList();
-                Transition.CrossFade(list, () => list.SetGroups(shown), 260);
-                UpdateEmpty();
-                Host.UpdateStatus();
+                var th = new Thread(() =>
+                {
+                    var rts = ReadRuntimes();
+                    RunUI(() =>
+                    {
+                        if (scanning || working) return;   // a new check owns the list now
+                        vendorCats = vendorCats.Where(x => !"runtimes".Equals(x.Tag)).Concat(RuntimeGroups(rts)).ToList();
+                        var shown = cats.Concat(vendorCats).ToList();
+                        Transition.CrossFade(list, () => list.SetGroups(shown), 260);
+                        UpdateEmpty();
+                        Host.UpdateStatus();
+                    });
+                }) { IsBackground = true };
+                th.Start();
             });
         }
 
@@ -805,6 +834,8 @@ namespace DriveUp
                 items = items.Where(i => i.Checked).ToList();
                 updates = updates.Except(firmware).ToList();
                 OnChecksChanged();
+                // The tick marks animate to the new state (left as they were, the skipped firmware still looked ticked).
+                list.RefreshChecks();
                 list.Invalidate();
                 if (updates.Count == 0 || Busy || !Host.CanStartOperation()) return;
             }
@@ -855,8 +886,9 @@ namespace DriveUp
                         float overall = baseP + (1 - baseP) * (phase == 0 ? frac * 0.45f : 0.45f + frac * 0.55f);
                         ring.SetProgress(overall);
                         int n = Math.Max(0, Math.Min(total - 1, idx));
-                        ring.Caption = (phase == 0 ? L.T("скачивание", "downloading") : L.T("установка", "installing")) +
-                                       (total > 1 ? " · " + (n + 1) + L.T(" из ", " of ") + total : "");
+                        // Fades only when the step changes (preparing → downloading → installing); the counter just changes.
+                        ring.SetCaption((phase == 0 ? L.T("скачивание", "downloading") : L.T("установка", "installing")) +
+                                        (total > 1 ? " · " + (n + 1) + L.T(" из ", " of ") + total : ""), phase != lastPhase);
                         if (n != lastIdx || phase != lastPhase)
                         {
                             for (int i = 0; i < updates.Count; i++)

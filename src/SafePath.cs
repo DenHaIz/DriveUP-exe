@@ -50,12 +50,9 @@ namespace DriveUp
         }
 
         /// <summary>
-        /// A new empty folder that only administrators and SYSTEM may change, under %SystemRoot%\Temp
-        /// (a folder ordinary users cannot replace). Random name, refused if it already exists.
-        /// </summary>
-        /// <summary>
         /// Staging folders left by an earlier run (closed mid-download, power cut) are removed at start:
-        /// only DriveUP-* under %SystemRoot%\Temp, older than half a day, never through a link.
+        /// only DriveUP-* under %SystemRoot%\Temp, older than half a day, never through a link, and only those
+        /// DriveUP itself made (see <see cref="Ours"/>).
         /// </summary>
         public static void CleanStale()
         {
@@ -67,7 +64,7 @@ namespace DriveUp
                 {
                     try
                     {
-                        if (IsLink(dir) || DateTime.UtcNow - Directory.GetCreationTimeUtc(dir) < TimeSpan.FromHours(12)) continue;
+                        if (IsLink(dir) || DateTime.UtcNow - Directory.GetCreationTimeUtc(dir) < TimeSpan.FromHours(12) || !Ours(dir)) continue;
                         Directory.Delete(dir, true);
                     }
                     catch { }
@@ -76,6 +73,32 @@ namespace DriveUp
             catch { }
         }
 
+        /// <summary>
+        /// Made by <see cref="NewStaging"/>: owned by Administrators or SYSTEM, with a protected list that lets
+        /// nobody else in. Any user may create a "DriveUP-x" folder in %SystemRoot%\Temp and, owning it, turn it into
+        /// a link half-way through a recursive delete (deleting files anywhere as administrator); such a folder
+        /// is not owned by an administrator group and is left alone. Ours cannot be changed by anyone else.
+        /// </summary>
+        static bool Ours(string dir)
+        {
+            var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+            var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            var sec = Directory.GetAccessControl(dir, AccessControlSections.Owner | AccessControlSections.Access);
+            var owner = sec.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
+            if (owner == null || (owner != admins && owner != system)) return false;
+            if (!sec.AreAccessRulesProtected) return false;
+            foreach (FileSystemAccessRule rule in sec.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            {
+                var sid = rule.IdentityReference as SecurityIdentifier;
+                if (rule.AccessControlType == AccessControlType.Allow && sid != admins && sid != system) return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// A new empty folder that only administrators and SYSTEM may change, under %SystemRoot%\Temp
+        /// (a folder ordinary users cannot replace). Random name, refused if it already exists.
+        /// </summary>
         public static string NewStaging()
         {
             if (!Elevated)
@@ -93,11 +116,20 @@ namespace DriveUp
                 var sec = new DirectorySecurity();
                 sec.SetAccessRuleProtection(true, false);
                 var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+                // Owned by the group (also as the built-in Administrator account): how CleanStale knows it is ours.
+                sec.SetOwner(admins);
                 foreach (var sid in new[] { admins, new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null) })
                     sec.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl,
                         InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
                 // Created with these rights in one step: there is no moment when anyone else could write.
-                Directory.CreateDirectory(dir, sec);
+                try { Directory.CreateDirectory(dir, sec); }
+                catch (Exception)
+                {
+                    if (Directory.Exists(dir) || File.Exists(dir)) continue;
+                    // A token that may not name the group as owner: the default owner (then left for Windows to clean up).
+                    var plain = new DirectorySecurity(); plain.SetSecurityDescriptorBinaryForm(sec.GetSecurityDescriptorBinaryForm(), AccessControlSections.Access);
+                    Directory.CreateDirectory(dir, plain);
+                }
                 if (IsLink(dir)) throw new IOException(L.T("временная папка подменена ссылкой", "the temporary folder was replaced by a link"));
                 return dir;
             }
@@ -139,6 +171,31 @@ namespace DriveUp
             if (depth >= 16) return;
             foreach (var d in Directory.GetDirectories(from))
                 if (!IsLink(d)) Copy(d, Path.Combine(to, Path.GetFileName(d)), depth + 1);
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct SECURITY_ATTRIBUTES { public int Length; public IntPtr Descriptor; public bool Inherit; }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool CreateDirectoryW(string path, ref SECURITY_ATTRIBUTES sa);
+
+        /// <summary>
+        /// Creates a folder that did not exist, with these permissions from its first moment; false if something
+        /// with that name is already there (Directory.CreateDirectory would quietly reuse a folder someone else made).
+        /// </summary>
+        public static bool CreateNew(string path, DirectorySecurity sec)
+        {
+            byte[] sd = sec.GetSecurityDescriptorBinaryForm();
+            var pin = GCHandle.Alloc(sd, GCHandleType.Pinned);
+            try
+            {
+                var sa = new SECURITY_ATTRIBUTES { Length = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), Descriptor = pin.AddrOfPinnedObject() };
+                if (CreateDirectoryW(path, ref sa)) return true;
+                int err = Marshal.GetLastWin32Error();
+                if (err == 183 /* ERROR_ALREADY_EXISTS */) return false;
+                throw new System.ComponentModel.Win32Exception(err);
+            }
+            finally { pin.Free(); }
         }
 
         static bool? elevated;
