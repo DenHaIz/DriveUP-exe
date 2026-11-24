@@ -45,6 +45,26 @@ namespace DriveUp
                     Glyph = "\uE839";
                     Name = () => L.T("Скорость и дуплекс сетевой карты", "Network card speed and duplex");
                     break;
+                case "rxbuf":
+                    // As many receive buffers as the driver allows (its INF gives the maximum).
+                    keywords = new[] { "*ReceiveBuffers" };
+                    target = key == null ? "" : Reg.Get(true, key + @"\Ndi\params\*ReceiveBuffers", "max") as string ?? "";
+                    if (target.Length == 0) keywords = new string[0];
+                    Glyph = "\uE839";
+                    Name = () => L.T("Буферы приёма сетевой карты", "Network card receive buffers");
+                    break;
+                case "jumbo":
+                    keywords = new[] { "*JumboPacket" };
+                    target = "1514";
+                    Glyph = "\uE9D2";
+                    Name = () => L.T("Большие кадры (Jumbo)", "Jumbo frames");
+                    break;
+                case "suspend":
+                    keywords = new[] { "*SelectiveSuspend" };
+                    target = "0";
+                    Glyph = "\uE83E";
+                    Name = () => L.T("Усыпление USB-адаптера", "USB adapter suspend");
+                    break;
                 default:
                     keywords = new[] { "*RSS" };
                     target = "1";
@@ -121,6 +141,9 @@ namespace DriveUp
             {
                 case "eee": return on ? L.T("выключено", "off") : L.T("включено", "on");
                 case "duplex": return on ? L.T("авто", "auto") : L.T("задано вручную", "set by hand");
+                case "rxbuf": return on ? L.T("максимум (", "maximum (") + target + ")" : L.T("меньше максимума", "below the maximum");
+                case "jumbo": return on ? L.T("выключены (1514)", "off (1514)") : L.T("включены", "on");
+                case "suspend": return on ? L.T("выключено", "off") : L.T("включено", "on");
                 default: return on ? L.T("включено", "on") : L.T("выключено", "off");
             }
         }
@@ -175,6 +198,82 @@ namespace DriveUp
             }
             catch { }
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Whether Windows may switch the network adapter off to save power (Device Manager → Power Management):
+    /// PnPCapabilities in the driver's key, 24 = not allowed. "1" = not allowed (as the fix wants it).
+    /// </summary>
+    class NicPower : Tweak
+    {
+        public readonly string Guid;
+        readonly string key;
+
+        public NicPower(string guid)
+        {
+            Guid = guid;
+            Id = "net.pnp." + guid;
+            Category = TuneCat.Network;
+            Glyph = "\uE83E";
+            Name = () => L.T("Отключение сетевой карты ради экономии", "Network card turned off to save power");
+            key = NetCheck.ClassKeyOf(guid);
+        }
+
+        public override bool Available(Machine m) { return key != null; }
+        public override string Capture()
+        {
+            if (key == null) throw new InvalidOperationException(L.T("Сетевая карта не найдена", "The network card was not found"));
+            return Reg.Capture(true, key, "PnPCapabilities");
+        }
+        public override void Restore(string raw) { Reg.Restore(true, key, "PnPCapabilities", raw); NicRestart.Mark(Guid); }
+        public override string ValueOf(string raw)
+        {
+            int? v = Reg.RawDword(raw);
+            return v.HasValue && (v.Value & 0x18) == 0x18 ? "1" : "0";
+        }
+        public override void Set(string value)
+        {
+            if (value != "1") return;
+            int now = Reg.Dword(true, key, "PnPCapabilities") ?? 0;
+            Reg.SetDword(true, key, "PnPCapabilities", now | 0x18);
+            NicRestart.Mark(Guid);
+        }
+        public override string Describe(string value) { return value == "1" ? L.T("запрещено", "not allowed") : L.T("разрешено", "allowed"); }
+    }
+
+    /// <summary>The TCP congestion control of the Internet template (netsh int tcp supplemental): CUBIC as Windows ships it.</summary>
+    class Congestion : Tweak
+    {
+        static readonly string[] Known = { "newreno", "ctcp", "dctcp", "ledbat", "cubic", "bbr2" };
+
+        public Congestion()
+        {
+            Id = "net.congestion";
+            Category = TuneCat.Network;
+            Glyph = "\uE713";
+            Name = () => L.T("Управление перегрузкой TCP", "TCP congestion control");
+        }
+
+        public override string Capture()
+        {
+            using (var s = new ManagementObjectSearcher(@"root\StandardCimv2", "SELECT CongestionProvider FROM MSFT_NetTCPSetting WHERE SettingName='Internet'"))
+                foreach (ManagementObject o in s.Get())
+                    using (o) return NetCheck.CongestionName(Convert.ToInt32(o["CongestionProvider"], CultureInfo.InvariantCulture));
+            throw new InvalidOperationException(L.T("Windows не сообщила настройку TCP", "Windows did not report the TCP setting"));
+        }
+
+        public override void Restore(string raw) { Set(raw); }
+        public override string ValueOf(string raw) { return raw == "default" ? "cubic" : raw; }
+        public override void Set(string value)
+        {
+            if (Array.IndexOf(Known, value) < 0) return;
+            NetFix.Netsh("int tcp set supplemental template=internet congestionprovider=" + value);
+        }
+        public override string Describe(string value) { return value == "cubic" ? L.T("CUBIC, как в Windows", "CUBIC, Windows default") : value.ToUpperInvariant(); }
+        public override bool Available(Machine m)
+        {
+            try { Capture(); return true; } catch { return false; }
         }
     }
 
@@ -372,7 +471,9 @@ namespace DriveUp
         static PowerSetting wifiPower;
         static TcpTuning tuning;
         static RssGlobal rss;
+        static Congestion congestion;
         static RegValue ipv6, doLimit;
+        static readonly Dictionary<string, RegValue> tcpValues = new Dictionary<string, RegValue>();
 
         /// <summary>The fixed ones go into the tuner's catalog (so "Changed" finds them); per-adapter ones are made by id.</summary>
         public static void Register(List<Tweak> catalog)
@@ -395,7 +496,16 @@ namespace DriveUp
             doLimit = new RegValue(@"SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization", "DOPercentageMaxBackgroundBandwidth", v =>
                 v == "-" || v == "0" ? L.T("без ограничения", "no limit") : L.T("до ", "up to ") + v + L.T(" % канала", " % of the line"))
             { Id = "net.dolimit", Category = TuneCat.Network, Glyph = "\uE896", Name = () => L.T("Фоновые загрузки обновлений Windows", "Windows Update background downloads") };
-            catalog.AddRange(new Tweak[] { wifiPower, tuning, rss, ipv6, doLimit });
+            congestion = new Congestion();
+            catalog.AddRange(new Tweak[] { wifiPower, tuning, rss, congestion, ipv6, doLimit });
+            foreach (var name in NetCheck.HarmfulTcp)
+            {
+                string n = name;
+                var t = new RegValue(@"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters", n, v => v == "-" ? L.T("нет (как в Windows)", "none (Windows default)") : n + " = " + v)
+                { Id = "net.tcp." + n, Category = TuneCat.Network, Glyph = "\uE713", Name = () => L.T("Параметр TCP ", "TCP parameter ") + n, NeedsReboot = true };
+                tcpValues[n] = t;
+                catalog.Add(t);
+            }
         }
 
         /// <summary>A per-adapter or per-service fix saved earlier, made again from its id.</summary>
@@ -409,6 +519,11 @@ namespace DriveUp
                 return t.Available(null) ? t : null;
             }
             if (id.StartsWith("net.dns.", StringComparison.Ordinal)) return new DnsServers(id.Substring(8));
+            if (id.StartsWith("net.pnp.", StringComparison.Ordinal))
+            {
+                var t = new NicPower(id.Substring(8));
+                return t.Available(null) ? t : null;
+            }
             if (id.StartsWith("net.svc.", StringComparison.Ordinal))
             {
                 string name = id.Substring(8);
@@ -520,6 +635,31 @@ namespace DriveUp
                 if (c.NicValues.TryGetValue("*SpeedDuplex", out sd) && sd != "0")
                     s.Add(Step(new NicProperty(p.Guid, "duplex"), "1", () => L.T("Карта и роутер сами договорятся о лучшей скорости и полном дуплексе", "The card and the router agree on the best speed and full duplex themselves")));
             }
+            if (p != null && p.ClassKey != null)
+            {
+                if (c.DiscardsUnderLoad && !c.RxAtMax)
+                {
+                    var rx = new NicProperty(p.Guid, "rxbuf");
+                    if (rx.Available(m))
+                        s.Add(Step(rx, "1", () => L.T("Под нагрузкой карта отбрасывала пакеты: с большим запасом буферов она успеет их принять", "Under load the card dropped packets: with more buffers it keeps up")));
+                }
+                if (c.JumboBroken)
+                    s.Add(Step(new NicProperty(p.Guid, "jumbo"), "1", () => L.T("Роутер не принимает большие кадры: стандартный размер вернёт крупные пакеты в домашней сети", "The router does not take jumbo frames: the standard size brings large packets on the home network back")));
+                string ss;
+                if (c.UsbAdapter && c.NicValues.TryGetValue("*SelectiveSuspend", out ss) && ss != "0")
+                {
+                    var su = new NicProperty(p.Guid, "suspend");
+                    if (su.Available(m))
+                        s.Add(Step(su, "1", () => L.T("USB-адаптер не будет засыпать между передачами — меньше обрывов", "The USB adapter no longer sleeps between transfers — fewer drops"), !c.DropTrouble));
+                }
+                string pnp;
+                int caps;
+                bool mayOff = !(c.NicValues.TryGetValue("PnPCapabilities", out pnp) && int.TryParse(pnp, out caps) && (caps & 0x18) == 0x18);
+                bool trouble = c.DropTrouble || (p.Kind == LinkKind.WiFi ? c.WifiTrouble : c.WiredTrouble);
+                if (mayOff && trouble)
+                    s.Add(Step(new NicPower(p.Guid), "1", () => L.T("Связь пропадала: Windows больше не будет отключать карту ради экономии энергии", "The link dropped: Windows will no longer turn the card off to save power")));
+            }
+
             string nicRss;
             if (p != null && p.ClassKey != null && c.NicValues.TryGetValue("*RSS", out nicRss) && nicRss == "0" && m.Cores > 1)
                 s.Add(Step(new NicProperty(p.Guid, "rss"), "1", () => L.T("Приём сети снова делят несколько ядер, как задумано в Windows", "Several cores share the network work again, as Windows intends")));
@@ -537,6 +677,27 @@ namespace DriveUp
                 s.Add(Step(tuning, "normal", () => L.T("Без неё скорость на быстрых и дальних соединениях падает в разы — вернётся как в Windows", "Without it fast and distant connections lose most of their speed — back to the Windows default")));
             if (c.RssOff)
                 s.Add(Step(rss, "1", () => L.T("Приём сети снова делят несколько ядер, как задумано в Windows", "Several cores share the network work again, as Windows intends")));
+            if (c.Congestion != "" && c.Congestion != "cubic" && c.Congestion != "default" && congestion.Available(m))
+                s.Add(Step(congestion, "cubic", () => c.Congestion == "bbr2"
+                    ? L.T("BBR2 в Windows ещё экспериментальный: с ним зависают соединения (WSL, Docker, лаунчеры) — вернётся CUBIC", "BBR2 is still experimental in Windows: connections hang with it (WSL, Docker, launchers) — back to CUBIC")
+                    : L.T("Вернётся CUBIC, как в Windows 10/11: старые алгоритмы на современных линиях медленнее", "Back to CUBIC, as in Windows 10/11: old algorithms are slower on modern lines")));
+            foreach (var t in c.TcpLeftovers)
+            {
+                RegValue rv;
+                if (!tcpValues.TryGetValue(t.Item1, out rv)) continue;
+                string n = t.Item1;
+                s.Add(Step(rv, "-", () => n == "EnablePMTUDiscovery" ? L.T("Windows снова будет узнавать размер пакета на пути, а не слать по 576 байт", "Windows finds the path's packet size again instead of sending 576 bytes")
+                    : n == "DisableTaskOffload" ? L.T("Карта снова будет сама считать контрольные суммы и нарезать пакеты — меньше нагрузки на процессор", "The card computes checksums and splits packets itself again — less load on the processor")
+                    : L.T("Пакеты снова будут доживать до дальних серверов", "Packets live long enough to reach distant servers again")));
+            }
+            foreach (var d in c.DeadServices)
+            {
+                var svc = new ServiceTweak(d.Item1) { Id = "net.svc." + d.Item1, Category = TuneCat.Network, Glyph = "\uE912" };
+                string title = Reg.Get(true, @"SYSTEM\CurrentControlSet\Services\" + d.Item1, "DisplayName") as string ?? d.Item1;
+                if (title.StartsWith("@")) title = d.Item1;
+                svc.Name = () => title;
+                s.Add(Step(svc, d.Item2, () => L.T("Служба нужна для работы сети — вернётся обычный тип запуска", "The network needs this service — its usual start type comes back")));
+            }
 
             foreach (var o in c.Optimizers)
             {
@@ -551,7 +712,7 @@ namespace DriveUp
             // DNS: only where the network's own fails or is clearly slower, never on a managed PC or through a VPN.
             var best = c.BestPublic;
             var main = c.Main ?? p;
-            if (c.SlowDns && best != null && main != null && main == p && !m.Managed && !c.Vpn)
+            if (c.SlowDns && best != null && main != null && main == p && !m.Managed && !c.Vpn && !c.InternalDns)
             {
                 string list = Pair(best.Server.ToString());
                 s.Add(Step(new DnsServers(main.Guid), list,

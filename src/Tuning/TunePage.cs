@@ -30,6 +30,10 @@ namespace DriveUp
         // ---------- "Check network" ----------
         readonly NetCard netCard = new NetCard();
         readonly NetOffer offer = new NetOffer();
+        readonly HoverCard hoverCard = new HoverCard();
+        readonly NetDetails details = new NetDetails();
+        readonly object hoverKey = new object();
+        TuneRow hoverRow;
         /// <summary>Two more minutes of quiet pinging (drops, Wi-Fi's periodic spikes).</summary>
         readonly ToggleSwitch swLong = new ToggleSwitch("");
         readonly FlatButton btnRecheck;
@@ -114,7 +118,18 @@ namespace DriveUp
             swLong.Visible = false;
             swLong.CheckedChanged += (s, e) => { lock (Settings.Sync) Settings.NetLong = swLong.Checked; Settings.Save(); };
             listCard.Controls.Add(swLong);
-            list.ActionClicked += row => { if (row.Finding != null && row.Finding.Id == "driver") Host.OpenTab(0); };
+            list.ActionClicked += row =>
+            {
+                var f = row.Finding;
+                if (f == null) return;
+                if (f.Url != null) { try { UserShell.OpenUrl(f.Url); } catch { } }
+                else if (f.Id == "driver") Host.OpenTab(0);
+            };
+            list.RowHover += (row, rect) => RowHover(row, rect);
+            list.RowOpened += row => { if (row.Finding != null) OpenDetails(row.Finding); };
+            details.BackClicked += (s, e) => CloseDetails(true);
+            listCard.Controls.Add(details);
+            listCard.Controls.Add(hoverCard);
             offer.Accepted += (s, e) => { if (!working) ShowNet(true); };
             Controls.Add(offer);
 
@@ -183,6 +198,8 @@ namespace DriveUp
             var right = btnApply.Visible ? (btnRecheck.Visible ? btnRecheck : btnApply) : btnReturnAll;
             info.SetBounds(S(20), fy, Math.Max(S(60), right.Left - S(32)), footH);
             list.SetBounds(S(2), listCard.TitleHeight, listCard.Width - S(4), fy - listCard.TitleHeight);
+            details.Bounds = list.Bounds;
+            hoverCard.Close();
             listCard.Invalidate();
         }
 
@@ -418,6 +435,7 @@ namespace DriveUp
             if (m == selected && m == rowsMode && !force && !showChanged && !netView) return;
             int from = rowsMode != null ? Tuner.Modes.IndexOf(rowsMode) : 0, to = Tuner.Modes.IndexOf(m);
             offer.Close();
+            CloseDetails(false);
             if (netView)
             {
                 // Back from the network report (its card sits under the modes: the plan comes from below).
@@ -526,6 +544,7 @@ namespace DriveUp
         void ShowView(bool changed)
         {
             if (showChanged == changed && loaded) return;
+            CloseDetails(false);
             showChanged = changed;
             btnApply.Visible = !changed;
             btnReturnAll.Visible = changed;
@@ -837,6 +856,7 @@ namespace DriveUp
         void StartNet()
         {
             if (netRunning || working) return;
+            CloseDetails(false);
             // The computer is still being read: the check starts as soon as it is.
             if (machine == null) { netWanted = true; return; }
             netWanted = false;
@@ -1017,6 +1037,81 @@ namespace DriveUp
             }
             info.SetText(t);
             LayoutList();
+        }
+
+        // ---------- the hover card and the details of a report row ----------
+
+        /// <summary>The pointer rests on a row: after a moment its card rises (at once when one is already up).</summary>
+        void RowHover(TuneRow row, Rectangle rect)
+        {
+            hoverRow = row;
+            Anim.Cancel(hoverKey);
+            if (row == null || details.Visible) { hoverCard.Close(); return; }
+            Action show = () =>
+            {
+                if (hoverRow != row || details.Visible || IsDisposed) return;
+                var r = list.RowBounds(row);
+                if (r.IsEmpty) return;
+                ShowCard(row, new Rectangle(list.Left + r.X, list.Top + r.Y, r.Width, r.Height));
+            };
+            if (hoverCard.Visible) show();
+            else Anim.Run(hoverKey, 420, t => { }, show, t => t);
+        }
+
+        void ShowCard(TuneRow row, Rectangle at)
+        {
+            var p = Theme.Current;
+            var lines = new List<Tuple<string, Color, Font>>();
+            string title, hint;
+            Color edge;
+            var f = row.Finding;
+            if (f != null)
+            {
+                title = f.Title();
+                edge = f.Level == NetLevel.Bad ? p.Danger : f.Level == NetLevel.Warn ? p.Warning : f.Level == NetLevel.Good ? p.Success : p.Accent;
+                lines.Add(Tuple.Create(f.Value(), f.Problem ? Anim.Blend(p.Text, edge, 0.7f) : p.Text, Theme.UiFont));
+                lines.Add(Tuple.Create(f.Detail(), p.TextDim, Theme.UiFont));
+                var steps = f.Advice.Take(3).Select(a => "• " + a.Title + (a.Auto ? L.T(" — DriveUP исправит", " — DriveUP fixes it") : "")).ToList();
+                if (f.Problem && steps.Count > 0) lines.Add(Tuple.Create(string.Join("\n", steps), p.Text, Theme.SmallFont));
+                hint = f.More != null ? L.T("Нажмите — подробности, решения и команды для администратора", "Click for details, fixes and admin commands") : "";
+            }
+            else if (row.Tweak != null)
+            {
+                title = row.Tweak.Name();
+                edge = row.State == TuneState.Failed ? p.Danger : row.Kind == TuneKind.Changed ? p.Accent : row.Warn != null ? p.Warning : p.Accent;
+                foreach (var l in TuneList.TipLines(row))
+                    lines.Add(Tuple.Create(l, l.StartsWith(L.T("Ошибка", "Error")) ? p.Danger : l.StartsWith(L.T("Внимание", "Note")) ? p.Warning : p.TextDim, Theme.UiFont));
+                hint = "";
+            }
+            else return;
+            var area = new Rectangle(list.Left, list.Top, list.Width, list.Height);
+            hoverCard.Open(title, lines, hint, edge, at, area);
+        }
+
+        void OpenDetails(NetFinding f)
+        {
+            Anim.Cancel(hoverKey);
+            hoverCard.Close();
+            if (f.More == null) return;
+            details.Bounds = list.Bounds;
+            Transition.CrossFade(listCard, () =>
+            {
+                details.ShowFinding(f);
+                details.Visible = true;
+                details.BringToFront();
+                // Hidden under the details: the "after" picture does not paint the whole list for nothing.
+                list.Visible = false;
+            }, 260, S(28));
+            details.Focus();
+        }
+
+        /// <summary>Back to the report (animated), or at once when the list is about to change anyway.</summary>
+        void CloseDetails(bool animate)
+        {
+            if (!details.Visible) return;
+            if (animate) Transition.CrossFade(listCard, () => { list.Visible = true; details.Visible = false; }, 220, -S(28));
+            else { list.Visible = true; details.Visible = false; }
+            list.Focus();
         }
 
         /// <summary>Adapters whose driver settings changed are restarted once, after all the changes (worker thread).</summary>

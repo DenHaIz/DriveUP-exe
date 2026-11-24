@@ -142,7 +142,10 @@ namespace DriveUp
         public event Action<List<TuneRow>> ReturnGroup;
         /// <summary>The button on a network report row was clicked.</summary>
         public event Action<TuneRow> ActionClicked;
-        readonly ToolTip tip = new ToolTip { InitialDelay = 500, ReshowDelay = 200, AutoPopDelay = 15000 };
+        /// <summary>A network report row was clicked (not its button): open its details.</summary>
+        public event Action<TuneRow> RowOpened;
+        /// <summary>The pointer rests on another row (null: on none), with where that row is drawn — for the hover card.</summary>
+        public event Action<TuneRow, Rectangle> RowHover;
         TuneRow tipRow;
         public string EmptyText = "", EmptyGlyph = "";
         /// <summary>While true, clicks change nothing (settings are being applied).</summary>
@@ -372,6 +375,7 @@ namespace DriveUp
 
         void ScrollTo(float target)
         {
+            SetTip(null);
             scrollTarget = Math.Max(0, Math.Min(MaxScroll, target));
             Anim.Follow(scrollKey, () => scroll, v => { scroll = v; Invalidate(); }, () => scrollTarget);
         }
@@ -386,6 +390,26 @@ namespace DriveUp
         {
             int w = Math.Max(S(96), MeasureWidth(L.T("Вернуть", "Return"), Font) + S(44)), h = S(30);
             return new Rectangle(Width - S(10) - S(14) - w, (int)(y + (RowH - h) / 2f), w, h);
+        }
+
+        /// <summary>Where a row is drawn now (list coordinates), or empty.</summary>
+        public Rectangle RowBounds(TuneRow row)
+        {
+            float y = -(float)Math.Round(scroll);
+            foreach (var r in rows)
+            {
+                float h = H(r);
+                if (r == row) return new Rectangle(0, (int)y, Width - S(10), (int)Math.Ceiling(h));
+                y += h;
+            }
+            return Rectangle.Empty;
+        }
+
+        void SetTip(TuneRow r)
+        {
+            if (r == tipRow) return;
+            tipRow = r;
+            if (RowHover != null) RowHover(r, r == null ? Rectangle.Empty : RowBounds(r));
         }
 
         TuneRow HitTest(Point pt, out bool onButton)
@@ -409,7 +433,8 @@ namespace DriveUp
         bool Clickable(TuneRow r, bool onButton)
         {
             if (r == null || Locked) return false;
-            if (r.Kind == TuneKind.Changed || r.Kind == TuneKind.Info) return onButton;
+            if (r.Kind == TuneKind.Info) return onButton || (r.Finding != null && r.Finding.Level != NetLevel.Pending && r.Finding.More != null);
+            if (r.Kind == TuneKind.Changed) return onButton;
             if (r.Kind == TuneKind.Header) return Group(r).Any(x => (x.Actionable || x.Kind == TuneKind.Changed) && x.Ready);
             return r.Actionable && r.Ready;
         }
@@ -419,7 +444,7 @@ namespace DriveUp
             base.OnMouseMove(e);
             bool onButton;
             var r = HitTest(e.Location, out onButton);
-            var hr = r != null && r.Kind != TuneKind.Changed && r.Kind != TuneKind.Info && Clickable(r, false) ? r : null;
+            var hr = r != null && r.Kind != TuneKind.Changed && Clickable(r, false) ? r : null;
             if (hr != hoverRow)
             {
                 if (hoverRow != null) Animate(hover, hoverRow, "h", 0, 220);
@@ -434,22 +459,15 @@ namespace DriveUp
                 hoverBtn = hb;
             }
             Cursor = hr != null || hb != null ? Cursors.Hand : Cursors.Default;
-            if (r != tipRow)
-            {
-                tipRow = r;
-                tip.SetToolTip(this, r != null && r.Kind != TuneKind.Header ? TipText(r) : null);
-            }
+            // The card waits for the pointer to rest; not over a header, a row still measuring or a button.
+            SetTip(r != null && r.Kind != TuneKind.Header && hb == null && !(r.Finding != null && r.Finding.Level == NetLevel.Pending) ? r : null);
         }
 
-        /// <summary>Everything about a row in full: the list cuts long texts short.</summary>
-        static string TipText(TuneRow r)
+        /// <summary>Everything about a setting row in full, line by line (the list cuts long texts short).</summary>
+        public static List<string> TipLines(TuneRow r)
         {
-            if (r.Kind == TuneKind.Info)
-            {
-                var f = r.Finding;
-                return f == null ? null : f.Title() + "\n" + f.Value() + (f.Detail().Length > 0 ? "\n" + f.Detail() : "");
-            }
-            var lines = new List<string> { r.Tweak.Name() };
+            var lines = new List<string>();
+            if (r.Tweak == null) return lines;
             if (r.Kind == TuneKind.Changed)
                 lines.Add(L.T("Было: ", "Was: ") + Show(r, r.Was) + L.T("   Сейчас: ", "   Now: ") + Show(r, r.Now));
             else if (r.Kind == TuneKind.Same) lines.Add(L.T("Уже: ", "Already: ") + Show(r, r.Now));
@@ -459,7 +477,7 @@ namespace DriveUp
             if (r.Warn != null) lines.Add(L.T("Внимание: ", "Note: ") + r.Warn());
             if (r.Tweak.NeedsReboot) lines.Add(L.T("Заработает после перезагрузки.", "Takes effect after a restart."));
             if (r.State == TuneState.Failed && r.Error.Length > 0) lines.Add(L.T("Ошибка: ", "Error: ") + r.Error);
-            return string.Join("\n", lines);
+            return lines;
         }
 
         protected override void OnMouseLeave(EventArgs e)
@@ -468,6 +486,7 @@ namespace DriveUp
             if (hoverRow != null) Animate(hover, hoverRow, "h", 0, 220);
             if (hoverBtn != null) Animate(btnHover, hoverBtn, "b", 0, 220);
             hoverRow = hoverBtn = null;
+            SetTip(null);
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
@@ -484,7 +503,9 @@ namespace DriveUp
             }
             if (r.Kind == TuneKind.Info)
             {
-                if (ActionClicked != null) ActionClicked(r);
+                SetTip(null);
+                if (onButton) { if (ActionClicked != null) ActionClicked(r); }
+                else if (RowOpened != null) RowOpened(r);
                 return;
             }
             if (r.Kind == TuneKind.Header)
@@ -771,6 +792,10 @@ namespace DriveUp
             if (f == null) return;
             int rh = S(88);
             g.SmoothingMode = SmoothingMode.AntiAlias;
+            float hv = Get(hover, r);
+            if (hv > 0.01f)
+                Theme.FillRound(g, Anim.Blend(bg, p.Hover, hv * 0.45f * a), new RectangleF(S(6), y + S(4), w - S(6), rh - S(8)), S(8));
+            if (hv > 0.01f) bg = Anim.Blend(bg, p.Hover, hv * 0.45f);
             float st = Get(stateT, r);
             float cx = S(27), cy = y + S(32);
             if (f.Level == NetLevel.Pending)
