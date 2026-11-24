@@ -140,6 +140,8 @@ namespace DriveUp
         public event Action<TuneRow> ReturnClicked;
         /// <summary>A group title in the "Changed" list was clicked: return all of its rows.</summary>
         public event Action<List<TuneRow>> ReturnGroup;
+        /// <summary>The button on a network report row was clicked.</summary>
+        public event Action<TuneRow> ActionClicked;
         readonly ToolTip tip = new ToolTip { InitialDelay = 500, ReshowDelay = 200, AutoPopDelay = 15000 };
         TuneRow tipRow;
         public string EmptyText = "", EmptyGlyph = "";
@@ -181,6 +183,7 @@ namespace DriveUp
                 // The wave covers the first screen; rows further down are already in place when scrolled to.
                 Anim.Delay(35 * Math.Min(i, 10), () => Animate(appear, r, "a", 1, 360));
             }
+            if (rows.Any(r => r.State == TuneState.Working)) Spin();
             Invalidate();
         }
 
@@ -231,7 +234,7 @@ namespace DriveUp
                 y += H(r);
             }
             if (y < scrollTarget) ScrollTo(y - S(44));
-            else if (y + RowH > scrollTarget + Height) ScrollTo(y + RowH - Height + S(8));
+            else if (y + BaseH(row) > scrollTarget + Height) ScrollTo(y + BaseH(row) - Height + S(8));
         }
 
         public void SetState(TuneRow row, TuneState state, string error = "")
@@ -241,14 +244,20 @@ namespace DriveUp
             row.Error = error ?? "";
             stateT[row] = 0;
             Animate(stateT, row, "s", 1, state == TuneState.Done ? 420 : 260);
-            if (state == TuneState.Working)
-                Anim.Frame(spinKey, () =>
-                {
-                    if (IsDisposed || !rows.Any(r => r.State == TuneState.Working)) return false;
-                    if (Anim.Shown(this)) foreach (var w in rows.Where(r => r.State == TuneState.Working).ToList()) InvalidateRow(w);
-                    return true;
-                });
-            Invalidate();
+            if (state == TuneState.Working) Spin();
+            // Only this row changes (the whole list cost up to ~30 ms a frame on software rendering).
+            InvalidateRow(row);
+        }
+
+        /// <summary>Repaints the rows being worked on every frame (spinners, live charts) while there are any.</summary>
+        void Spin()
+        {
+            Anim.Frame(spinKey, () =>
+            {
+                if (IsDisposed || !rows.Any(r => r.State == TuneState.Working)) return false;
+                if (Anim.Shown(this)) foreach (var w in rows.Where(r => r.State == TuneState.Working).ToList()) InvalidateRow(w);
+                return true;
+            });
         }
 
         /// <summary>Folds the row away, then drops it.</summary>
@@ -282,9 +291,72 @@ namespace DriveUp
             foreach (var r in rows) Animate(check, r, "c", r.Checked ? 1 : 0, r.Checked ? 260 : 160);
         }
 
+        /// <summary>
+        /// Adds a row at the end of its group (a new group gets its title first). It unfolds into place, so the rows
+        /// below slide down instead of jumping; the list follows it while the view is at the bottom.
+        /// </summary>
+        public void Append(TuneRow row)
+        {
+            bool follow = scrollTarget >= MaxScroll - S(8);
+            int at = -1;
+            for (int i = 0; i < rows.Count; i++) if (rows[i].Category == row.Category) at = i;
+            if (at < 0)
+            {
+                var head = new TuneRow { Kind = TuneKind.Header, Category = row.Category, Checked = false };
+                Insert(rows.Count, head);
+                at = rows.Count - 1;
+            }
+            Insert(at + 1, row);
+            // Once it has unfolded (the content is that much taller only then).
+            if (follow) Anim.Delay(330, () => { if (rows.Contains(row)) EnsureVisible(row); });
+        }
+
+        /// <summary>Adds a row at the very end, as it is (a title of its own, or rows under the last title).</summary>
+        public void AppendRow(TuneRow row)
+        {
+            Insert(rows.Count, row);
+        }
+
+        /// <summary>Scrolls so the row is near the top (the fixes after a network check).</summary>
+        public void ScrollToRow(TuneRow row)
+        {
+            float y = 0;
+            foreach (var r in rows)
+            {
+                if (r == row) break;
+                y += H(r);
+            }
+            ScrollTo(y - S(4));
+        }
+
+        void Insert(int index, TuneRow r)
+        {
+            rows.Insert(index, r);
+            loading = false;
+            check[r] = r.Checked ? 1 : 0;
+            stateT[r] = r.State == TuneState.Idle ? 0 : 1;
+            fold[r] = 0;
+            appear[r] = 0;
+            Animate(fold, r, "f", 1, 320);
+            Animate(appear, r, "a", 1, 420);
+            if (r.State == TuneState.Working) Spin();
+        }
+
+        /// <summary>A report row's finding changed (a result came in): its mark animates in.</summary>
+        public void Refresh(TuneRow row)
+        {
+            if (!rows.Contains(row)) return;
+            var f = row.Finding;
+            if (f != null && f.Level != NetLevel.Pending && row.State == TuneState.Working) SetState(row, TuneState.Done);
+            else InvalidateRow(row);
+            // The group title counts problems.
+            int i = rows.IndexOf(row);
+            for (int j = i; j >= 0; j--) if (rows[j].Kind == TuneKind.Header) { InvalidateRow(rows[j]); break; }
+        }
+
         // ---------- geometry ----------
 
-        int BaseH(TuneRow r) { return r.Kind == TuneKind.Header ? S(44) : RowH; }
+        int BaseH(TuneRow r) { return r.Kind == TuneKind.Header ? S(44) : r.Kind == TuneKind.Info ? S(88) : RowH; }
 
         float H(TuneRow r) { return BaseH(r) * (fold.ContainsKey(r) ? Anim.EaseInOut(fold[r]) : 1); }
 
@@ -325,7 +397,8 @@ namespace DriveUp
                 float h = H(r);
                 if (pt.Y >= y && pt.Y < y + h)
                 {
-                    onButton = r.Kind == TuneKind.Changed && r.Ready && ButtonRect(y).Contains(pt);
+                    onButton = (r.Kind == TuneKind.Changed && r.Ready && ButtonRect(y).Contains(pt)) ||
+                               (r.Kind == TuneKind.Info && r.Finding != null && r.Finding.ActionText != null && ActionRect(r, y).Contains(pt));
                     return r;
                 }
                 y += h;
@@ -336,7 +409,7 @@ namespace DriveUp
         bool Clickable(TuneRow r, bool onButton)
         {
             if (r == null || Locked) return false;
-            if (r.Kind == TuneKind.Changed) return onButton;
+            if (r.Kind == TuneKind.Changed || r.Kind == TuneKind.Info) return onButton;
             if (r.Kind == TuneKind.Header) return Group(r).Any(x => (x.Actionable || x.Kind == TuneKind.Changed) && x.Ready);
             return r.Actionable && r.Ready;
         }
@@ -346,7 +419,7 @@ namespace DriveUp
             base.OnMouseMove(e);
             bool onButton;
             var r = HitTest(e.Location, out onButton);
-            var hr = r != null && r.Kind != TuneKind.Changed && Clickable(r, false) ? r : null;
+            var hr = r != null && r.Kind != TuneKind.Changed && r.Kind != TuneKind.Info && Clickable(r, false) ? r : null;
             if (hr != hoverRow)
             {
                 if (hoverRow != null) Animate(hover, hoverRow, "h", 0, 220);
@@ -371,6 +444,11 @@ namespace DriveUp
         /// <summary>Everything about a row in full: the list cuts long texts short.</summary>
         static string TipText(TuneRow r)
         {
+            if (r.Kind == TuneKind.Info)
+            {
+                var f = r.Finding;
+                return f == null ? null : f.Title() + "\n" + f.Value() + (f.Detail().Length > 0 ? "\n" + f.Detail() : "");
+            }
             var lines = new List<string> { r.Tweak.Name() };
             if (r.Kind == TuneKind.Changed)
                 lines.Add(L.T("Было: ", "Was: ") + Show(r, r.Was) + L.T("   Сейчас: ", "   Now: ") + Show(r, r.Now));
@@ -402,6 +480,11 @@ namespace DriveUp
             if (r.Kind == TuneKind.Changed)
             {
                 if (ReturnClicked != null) ReturnClicked(r);
+                return;
+            }
+            if (r.Kind == TuneKind.Info)
+            {
+                if (ActionClicked != null) ActionClicked(r);
                 return;
             }
             if (r.Kind == TuneKind.Header)
@@ -436,6 +519,7 @@ namespace DriveUp
         {
             var p = Theme.Current;
             var g = e.Graphics;
+            double painted = Anim.FrameLog != null ? Anim.Now : 0;
             Color bg = ParentBg;
             g.Clear(bg);
             if (rows.Count == 0)
@@ -460,6 +544,7 @@ namespace DriveUp
                     // Rows rise into place as they appear.
                     float ry = (float)Math.Round(y + (1 - a) * S(12));
                     if (r.Kind == TuneKind.Header) PaintHeader(g, r, ry, w, bg, a);
+                    else if (r.Kind == TuneKind.Info) PaintInfo(g, r, ry, w, bg, a);
                     else PaintRow(g, r, ry, w, bg, a);
                     g.Restore(state);
                 }
@@ -477,13 +562,15 @@ namespace DriveUp
                 int ty = (int)((Height - th) * (scroll / Math.Max(1, content - Height)));
                 Theme.FillRound(g, p.Border, new RectangleF(Width - S(6), ty, S(4), th), S(2));
             }
+            if (Anim.FrameLog != null)
+                Anim.Log(string.Format(System.Globalization.CultureInfo.InvariantCulture, "P\tTuneList\t{0:F1}\t{1}", Anim.Now - painted, clip.Height));
         }
 
         void PaintEmpty(Graphics g, Color bg)
         {
             var p = Theme.Current;
             if (EmptyText.Length == 0) return;
-            int tile = S(64), top = (Height - tile - S(16) - S(40)) / 2;
+            int tile = S(64), top = (Height - tile - S(16) - S(60)) / 2;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             if (EmptyGlyph.Length > 0 && Theme.HasGlyphs)
             {
@@ -491,7 +578,7 @@ namespace DriveUp
                 Theme.FillRound(g, Anim.Blend(p.SurfaceAlt, p.Accent, 0.16f), box, S(16));
                 GlyphShape.Draw(g, EmptyGlyph, new PointF(box.X + tile / 2f, box.Y + tile / 2f), S(28), p.Accent, Math.Max(0.8f, S(1) * 1.1f));
             }
-            TextDraw.DrawText(g, EmptyText, Font, new Rectangle(S(24), top + tile + S(16), Width - S(48), S(44)), p.TextDim,
+            TextDraw.DrawText(g, EmptyText, Font, new Rectangle(S(24), top + tile + S(16), Width - S(48), S(66)), p.TextDim,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.Top | TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
         }
 
@@ -543,7 +630,13 @@ namespace DriveUp
             string title = Tuner.CategoryName(r.Category);
             TextDraw.DrawText(g, title, Theme.HeadFont, new RectangleF(S(48), top, w - S(220), S(32)), Anim.Blend(bg, p.Text, a), TextLeft);
             string count;
-            if (items.Any(i => i.Kind == TuneKind.Changed))
+            if (items.Count > 0 && items.All(i => i.Kind == TuneKind.Info))
+            {
+                int bad = items.Count(i => i.Finding != null && i.Finding.Problem);
+                bool busy = items.Any(i => i.Finding != null && i.Finding.Level == NetLevel.Pending);
+                count = busy ? L.T("измеряю…", "measuring…") : bad > 0 ? L.Count(bad, "замечание", "замечания", "замечаний", "issue", "issues") : L.T("в порядке", "fine");
+            }
+            else if (items.Any(i => i.Kind == TuneKind.Changed))
             {
                 count = L.Count(items.Count, "параметр", "параметра", "параметров", "setting", "settings") +
                         (items.Any(i => i.Ready) && !Locked ? L.T(" · вернуть группу", " · return group") : "");
@@ -625,7 +718,7 @@ namespace DriveUp
             else if (r.Kind == TuneKind.Changed)
             {
                 var mode = Tuner.Mode(r.ModeId);
-                sub = (mode != null ? L.T("режим «", "") + mode.Name() + L.T("»", " mode") : "") +
+                sub = (mode == NetFix.Mode ? L.T("проверка сети", "network check") : mode != null ? L.T("режим «", "") + mode.Name() + L.T("»", " mode") : "") +
                       (r.When != DateTime.MinValue ? (mode != null ? " · " : "") + L.When(r.When) : "");
             }
             else sub = r.Reason();
@@ -655,6 +748,215 @@ namespace DriveUp
             x += S(14) + S(10);
             TextDraw.DrawText(g, second, Theme.UiBold, new RectangleF(x, r.Y, r.Right - x, r.Height), Anim.Blend(bg, p.Text, ink), TextLeft);
         }
+
+        // ---------- network report rows ----------
+
+        const int ChartW = 168;
+
+        Rectangle ActionRect(TuneRow r, float y)
+        {
+            string t = r.Finding != null && r.Finding.ActionText != null ? r.Finding.ActionText() : "";
+            int w = Math.Max(S(96), MeasureWidth(t, Font) + S(44)), h = S(30);
+            return new Rectangle(Width - S(10) - S(14) - w, (int)(y + (S(88) - h) / 2f), w, h);
+        }
+
+        /// <summary>
+        /// What was measured: a status mark on the left (a spinner while measuring), the value, what it means, and on
+        /// the right the round trips as a live chart, or a button.
+        /// </summary>
+        void PaintInfo(Graphics g, TuneRow r, float y, int w, Color bg, float a)
+        {
+            var p = Theme.Current;
+            var f = r.Finding;
+            if (f == null) return;
+            int rh = S(88);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            float st = Get(stateT, r);
+            float cx = S(27), cy = y + S(32);
+            if (f.Level == NetLevel.Pending)
+            {
+                float rad = S(8);
+                double ang = (Anim.FrameNow * 0.4) % 360;   // the frame's time: the same turn every refresh
+                using (var track = new Pen(Anim.Blend(bg, p.Border, a), Math.Max(2f, S(2))))
+                    g.DrawEllipse(track, cx - rad, cy - rad, rad * 2, rad * 2);
+                using (var pen = new Pen(Anim.Blend(bg, p.Accent, a), Math.Max(2f, S(2))) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                    g.DrawArc(pen, cx - rad, cy - rad, rad * 2, rad * 2, (float)ang, 100);
+            }
+            else
+                LevelMark(g, f.Level, cx, cy, bg, a, r.State == TuneState.Done ? st : 1);
+
+            Color tone = LevelColor(f.Level);
+            var tile = new RectangleF(S(48), y + S(14), S(36), S(36));
+            Theme.FillRound(g, Anim.Blend(bg, Anim.Blend(p.SurfaceAlt, f.Problem ? tone : p.Accent, 0.12f), a), tile, S(9));
+            GlyphShape.Draw(g, f.Glyph, new PointF(tile.X + tile.Width / 2, tile.Y + tile.Height / 2), S(17),
+                Anim.Blend(bg, f.Problem ? tone : Anim.Blend(p.TextDim, p.Accent, 0.6f), a), Math.Max(0.8f, S(1) * 0.95f));
+
+            int x = S(96);
+            bool button = f.ActionText != null && !f.Chart;
+            int right = f.Chart ? S(ChartW) + S(24) : button ? ActionRect(r, y).Width + S(24) : S(8);
+            int textR = w - right;
+            TextDraw.DrawText(g, f.Title(), Theme.UiBold, new RectangleF(x, y + S(10), textR - x, S(22)), Anim.Blend(bg, p.Text, a), TextLeft);
+            TextDraw.DrawText(g, f.Value(), Font, new RectangleF(x, y + S(32), textR - x, S(20)),
+                Anim.Blend(bg, f.Problem ? Anim.Blend(p.Text, tone, 0.75f) : p.Text, a * (f.Level == NetLevel.Pending ? 0.6f : 1)), TextLeft);
+            TextDraw.DrawText(g, f.Detail(), Theme.SmallFont, new RectangleF(x, y + S(53), textR - x, S(32)), Anim.Blend(bg, p.TextDim, a * 0.95f),
+                TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.WordBreak | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+
+            if (f.Chart)
+                PaintChart(g, f, new RectangleF(w - S(ChartW) - S(10), y + S(14), S(ChartW), rh - S(28)), bg, a, tone,
+                    r.State == TuneState.Done ? Anim.EaseInOut(st) : 1);
+            else if (button)
+            {
+                var br = ActionRect(r, y);
+                float bh = Get(btnHover, r);
+                Theme.FillRound(g, Anim.Blend(bg, Anim.Blend(p.SurfaceAlt, p.Hover, bh), a), br, S(6));
+                Theme.DrawRound(g, Anim.Blend(bg, Anim.Blend(p.Border, p.Hover, bh), a), br, S(6));
+                int gx = br.X + S(12);
+                if (Theme.HasGlyphs)
+                {
+                    DrawGlyph(g, "\uE896", new Rectangle(gx, br.Y, S(16), br.Height), Anim.Blend(bg, Anim.Blend(p.TextDim, p.Accent, bh), a));
+                    gx += S(24);
+                }
+                TextDraw.DrawText(g, f.ActionText(), Font, new Rectangle(gx, br.Y, br.Right - gx - S(8), br.Height), Anim.Blend(bg, p.Text, a), TextLeft);
+            }
+            g.SmoothingMode = SmoothingMode.None;
+        }
+
+        static Color LevelColor(NetLevel l)
+        {
+            var p = Theme.Current;
+            // Information is neutral: the accent is red in this theme and would read as an error.
+            return l == NetLevel.Bad ? p.Danger : l == NetLevel.Warn ? p.Warning : l == NetLevel.Good ? p.Success : p.TextDim;
+        }
+
+        /// <summary>The result's mark: a disc that grows in, with a tick (good), "!" (warning, problem) or "i".</summary>
+        void LevelMark(Graphics g, NetLevel level, float cx, float cy, Color bg, float a, float st)
+        {
+            var p = Theme.Current;
+            Color c = LevelColor(level);
+            float grow = Anim.EaseOut(Math.Min(1, st * 1.6f));
+            float rad = S(10) * (0.6f + 0.4f * grow);
+            using (var b = new SolidBrush(Anim.Blend(bg, Anim.Blend(bg, c, p.IsDark ? 0.24f : 0.17f), a * Math.Min(1, st * 2))))
+                g.FillEllipse(b, cx - rad, cy - rad, rad * 2, rad * 2);
+            float t = Math.Max(0, (st - 0.25f) / 0.75f);
+            if (t <= 0) return;
+            float k = Theme.Scale;
+            using (var pen = new Pen(Anim.Blend(bg, c, a), Math.Max(1.8f, S(2))) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+            using (var dot = new SolidBrush(Anim.Blend(bg, c, a * t)))
+            {
+                if (level == NetLevel.Good)
+                {
+                    var p1 = new PointF(cx - 4.5f * k, cy + 0.5f * k);
+                    var p2 = new PointF(cx - 1.3f * k, cy + 3.6f * k);
+                    var p3 = new PointF(cx + 5f * k, cy - 3.6f * k);
+                    float t1 = Math.Min(1, t / 0.4f), t2 = Math.Max(0, (t - 0.4f) / 0.6f);
+                    if (t2 <= 0) g.DrawLine(pen, p1, new PointF(Anim.Lerp(p1.X, p2.X, t1), Anim.Lerp(p1.Y, p2.Y, t1)));
+                    else g.DrawLines(pen, new[] { p1, p2, new PointF(Anim.Lerp(p2.X, p3.X, t2), Anim.Lerp(p2.Y, p3.Y, t2)) });
+                }
+                else if (level == NetLevel.Info)
+                {
+                    // "i": the dot appears, the stem grows down.
+                    g.FillEllipse(dot, cx - 1.3f * k, cy - 5f * k, 2.6f * k, 2.6f * k);
+                    g.DrawLine(pen, cx, cy - 0.8f * k, cx, cy - 0.8f * k + 5f * k * t);
+                }
+                else
+                {
+                    // "!": the stem grows down, the dot appears.
+                    g.DrawLine(pen, cx, cy - 5f * k, cx, cy - 5f * k + 5.5f * k * t);
+                    g.FillEllipse(dot, cx - 1.3f * k, cy + 2.6f * k, 2.6f * k, 2.6f * k);
+                }
+            }
+        }
+
+        /// <summary>
+        /// The round trips as a line: the newest point travels in from the previous one over one sampling interval
+        /// and, once the window is full, the line slides left by the same fraction — so it moves every frame instead
+        /// of jumping five times a second. The scale eases towards the samples. Lost answers are red ticks.
+        /// </summary>
+        void PaintChart(Graphics g, NetFinding f, RectangleF box, Color bg, float a, Color tone, float settle)
+        {
+            var p = Theme.Current;
+            double[] all;
+            double at;
+            lock (f.Samples) { all = f.Samples.ToArray(); at = f.SampleAt; }
+            Theme.FillRound(g, Anim.Blend(bg, Anim.Blend(bg, p.SurfaceAlt, 0.8f), a), box, S(8));
+            if (all.Length == 0) return;
+            const int Window = 60;
+            bool live = f.Level == NetLevel.Pending;
+            double now = Anim.FrameNow;
+            float grow = live ? (float)Math.Max(0, Math.Min(1, (now - at) / f.Interval)) : 1;
+            bool full = all.Length >= Window;
+            // Full: one sample more than fits, so the left edge stays covered while the line slides.
+            int n = full ? Math.Min(all.Length, Window + 1) : all.Length;
+            var s = new double[n];
+            Array.Copy(all, all.Length - n, s, 0, n);
+
+            // Scale: a little above the highest visible sample (4 ms at least), eased towards it (~150 ms).
+            double top = 4;
+            foreach (var v in s) if (!double.IsNaN(v) && v * 1.2 > top) top = v * 1.2;
+            if (f.Scale <= 0 || !live) f.Scale = (float)top;
+            else
+            {
+                double dt = Math.Max(0, Math.Min(100, now - f.ScaleAt));
+                f.Scale += (float)((top - f.Scale) * (1 - Math.Exp(-dt / 150)));
+            }
+            f.ScaleAt = now;
+            float pad = S(6);
+            var inner = new RectangleF(box.X + pad, box.Y + pad + S(8), box.Width - pad * 2, box.Height - pad * 2 - S(8));
+            float step = inner.Width / (Window - 1);
+            // Finished with fewer samples than the window: the line stretches over the whole chart as the result settles.
+            if (!live && !full && n > 1) step = Anim.Lerp(step, inner.Width / (n - 1), settle);
+            float offset = full && live ? step * (1 - grow) : 0;
+            float baseY = inner.Bottom;
+
+            var state = g.Save();
+            g.SetClip(new RectangleF(box.X + 1, box.Y, box.Width - 2, box.Height));
+            var pts = new List<PointF>();
+            Color line = Anim.Blend(bg, live ? p.Accent : (f.Problem ? tone : p.Accent), a);
+            using (var pen = new Pen(line, Math.Max(1.4f, S(2) * 0.8f)) { LineJoin = LineJoin.Round, StartCap = LineCap.Round, EndCap = LineCap.Round })
+            using (var lost = new Pen(Anim.Blend(bg, p.Danger, a), Math.Max(1.4f, S(2) * 0.8f)))
+            using (var fill = new SolidBrush(Color.FromArgb((int)(38 * a), line)))
+            using (var dotBrush = new SolidBrush(line))
+            {
+                Action flush = () =>
+                {
+                    if (pts.Count >= 2)
+                    {
+                        var poly = new List<PointF>(pts) { new PointF(pts[pts.Count - 1].X, baseY), new PointF(pts[0].X, baseY) };
+                        g.FillPolygon(fill, poly.ToArray());
+                        g.DrawLines(pen, pts.ToArray());
+                    }
+                    else if (pts.Count == 1) g.FillEllipse(dotBrush, pts[0].X - 1.5f, pts[0].Y - 1.5f, 3, 3);
+                    pts.Clear();
+                };
+                for (int i = 0; i < n; i++)
+                {
+                    float xi = inner.X + (full ? (i - (n - Window)) * step : i * step) + offset;
+                    bool last = i == n - 1 && live;
+                    if (double.IsNaN(s[i]))
+                    {
+                        flush();
+                        if (!last || grow > 0.5f) g.DrawLine(lost, xi, baseY, xi, baseY - S(6));
+                        continue;
+                    }
+                    var pt = new PointF(xi, baseY - (float)Math.Min(1, s[i] / f.Scale) * inner.Height);
+                    // The newest point travels in from the previous one.
+                    if (last && pts.Count > 0)
+                    {
+                        var prev = pts[pts.Count - 1];
+                        pt = new PointF(Anim.Lerp(prev.X, pt.X, grow), Anim.Lerp(prev.Y, pt.Y, grow));
+                    }
+                    pts.Add(pt);
+                }
+                flush();
+            }
+            g.Restore(state);
+            // The scale's top, small, in the corner.
+            // (the target, not the eased value: a number that changed every frame would flicker)
+            string label = (top < 10 ? top.ToString("0.#") : Math.Round(top).ToString()) + L.T(" мс", " ms");
+            TextDraw.DrawText(g, label, Theme.SmallFont, new RectangleF(box.X + S(6), box.Y + S(3), box.Width - S(12), S(14)), Anim.Blend(bg, p.TextDim, a * 0.8f),
+                TextFormatFlags.Right | TextFormatFlags.Top | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+        }
+
 
         void PaintRight(Graphics g, TuneRow r, float y, int w, Color bg, Color rowBg, float a)
         {

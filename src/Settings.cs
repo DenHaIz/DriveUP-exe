@@ -22,6 +22,11 @@ namespace DriveUp
         /// <summary>Tuning: measure the system before the first change and offer a before/after comparison (off unless the user turns it on).</summary>
         public static bool TuneMeasure = false;
         public static DateTime LastCheck = DateTime.MinValue;
+        /// <summary>The last network check: when, and how many issues it found (-1 = never).</summary>
+        public static DateTime NetChecked = DateTime.MinValue;
+        public static int NetIssues = -1;
+        /// <summary>The network check adds 2 minutes of quiet pinging (drops, Wi-Fi's periodic spikes).</summary>
+        public static bool NetLong = false;
         /// <summary>Where driver backups go; empty = Documents\DriveUP Backup.</summary>
         public static string BackupRoot = "";
         /// <summary>The tuning mode applied last ("games", "work", "quiet"); empty = none.</summary>
@@ -131,6 +136,9 @@ namespace DriveUp
                 case "CheckOnStart": CheckOnStart = val == "1"; break;
                 case "TuneMeasure": TuneMeasure = val == "1"; break;
                 case "LastCheck": LastCheck = ParseDate(val); break;
+                case "NetChecked": NetChecked = ParseDate(val); break;
+                case "NetIssues": int n; NetIssues = int.TryParse(val, out n) ? n : -1; break;
+                case "NetLong": NetLong = val == "1"; break;
                 case "BackupRoot": BackupRoot = val; break;
                 case "TuneMode": TuneMode = val; break;
                 default:
@@ -260,6 +268,9 @@ namespace DriveUp
             sb.AppendLine("CheckOnStart=" + (CheckOnStart ? "1" : "0"));
             sb.AppendLine("TuneMeasure=" + (TuneMeasure ? "1" : "0"));
             sb.AppendLine("LastCheck=" + FormatDate(LastCheck));
+            sb.AppendLine("NetChecked=" + FormatDate(NetChecked));
+            sb.AppendLine("NetIssues=" + NetIssues.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            sb.AppendLine("NetLong=" + (NetLong ? "1" : "0"));
             sb.AppendLine("BackupRoot=" + BackupRoot);
             // Written aside and swapped in: a crash mid-write never leaves a half file (DriveUP
             // keeps the old values of changed settings here).

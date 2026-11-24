@@ -37,6 +37,8 @@ namespace DriveUp
         Changed,
         /// <summary>A group title ("Power and processor"): ticks or unticks the whole group.</summary>
         Header,
+        /// <summary>A line of the network report: what was measured and what it means (nothing to tick).</summary>
+        Info,
     }
 
     enum TuneState { Idle, Working, Done, Failed }
@@ -64,6 +66,8 @@ namespace DriveUp
         /// <summary>Processes of this program running now, and their memory (0 = none or not known).</summary>
         public int Procs;
         public long ProcMemory;
+        /// <summary>Info rows: the network check's finding shown on this row.</summary>
+        public NetFinding Finding;
 
         public bool Actionable { get { return Kind == TuneKind.Change || Kind == TuneKind.Return; } }
         /// <summary>Can be run (again): not started yet, or failed last time.</summary>
@@ -97,6 +101,14 @@ namespace DriveUp
                 case TuneCat.Startup: return L.T("Автозагрузка", "Startup");
                 case TuneCat.Privacy: return L.T("Реклама и подсказки", "Ads and suggestions");
                 case TuneCat.System: return L.T("Система и защита", "System and security");
+                case TuneCat.Network: return L.T("Сеть", "Network");
+                case TuneCat.NetLink: return L.T("Подключение", "Connection");
+                case TuneCat.NetLatency: return L.T("Задержка", "Delay");
+                case TuneCat.NetSpeed: return L.T("Скорость и нагрузка", "Speed and load");
+                case TuneCat.NetDns: return "DNS";
+                case TuneCat.NetPath: return L.T("Интернет и сервисы", "Internet and services");
+                case TuneCat.NetSystem: return L.T("Настройки Windows и драйвер", "Windows settings and the driver");
+                case TuneCat.NetFixes: return L.T("Что можно исправить", "What can be fixed");
                 default: return L.T("Обновления", "Updates");
             }
         }
@@ -783,6 +795,9 @@ namespace DriveUp
                     return s;
                 },
             });
+
+            // The network check's fixes: in the catalog for "Changed", never in a mode.
+            NetFix.Register(Catalog);
         }
 
         static TuneStep Step(Tweak t, string value, Func<string> reason)
@@ -807,10 +822,10 @@ namespace DriveUp
         /// <summary>A setting by id: from the catalog, or a startup program (those are found at run time).</summary>
         public static Tweak Find(string id)
         {
-            return Catalog.FirstOrDefault(t => t.Id == id) ?? (Tweak)StartupTweak.FromId(id) ?? PackagedStartupTweak.FromId(id);
+            return Catalog.FirstOrDefault(t => t.Id == id) ?? (Tweak)StartupTweak.FromId(id) ?? (Tweak)PackagedStartupTweak.FromId(id) ?? NetFix.FromId(id);
         }
 
-        public static TuneMode Mode(string id) { return Modes.FirstOrDefault(m => m.Id == id); }
+        public static TuneMode Mode(string id) { return Modes.FirstOrDefault(m => m.Id == id) ?? (id == NetFix.Mode.Id ? NetFix.Mode : null); }
 
         /// <summary>The mode that suits this computer best, and why (lower case, to follow the mode's name).</summary>
         public static TuneMode Recommend(Machine m, out string reason)
@@ -908,8 +923,13 @@ namespace DriveUp
         static List<TuneRow> PlanFor(TuneMode mode, Machine m)
         {
             Pc = m;
+            return RowsFor(StepsFor(mode, m));
+        }
+
+        /// <summary>Rows for these steps (now → new, or already so), in groups. Reads the settings: off the UI thread.</summary>
+        public static List<TuneRow> RowsFor(List<TuneStep> steps)
+        {
             var rows = new List<TuneRow>();
-            var steps = StepsFor(mode, m);
             var all = steps.Select(s => s.Tweak).GroupBy(t => t.Id).Select(g => g.First()).OrderBy(OrderKey).ToList();
             foreach (var t in all)
             {
@@ -1117,6 +1137,8 @@ namespace DriveUp
                 try { Return(r.Tweak); done++; }
                 catch (Exception ex) { failed++; errors.Add(r.Tweak.Name() + ": " + ex.Message); }
             }
+            // Network cards whose driver settings went back are restarted once.
+            try { NicRestart.Flush(); } catch { }
             Journal.Add(JournalKind.TuneReturn, done, failed, "/restore");
             string text = done + failed == 0
                 ? L.T("DriveUP ничего не менял — возвращать нечего.", "DriveUP changed nothing — there is nothing to return.")

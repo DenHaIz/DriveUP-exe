@@ -493,7 +493,16 @@ namespace DriveUp
     }
 
     /// <summary>Groups in the list, in the order they are shown and applied.</summary>
-    enum TuneCat { Power, Gaming, Interface, Services, Background, Apps, Tasks, Startup, Privacy, System, Updates }
+    enum TuneCat
+    {
+        Power, Gaming, Interface, Services, Background, Apps, Tasks, Startup, Privacy, System, Updates,
+        /// <summary>Fixes offered by "Check network" (never part of a mode).</summary>
+        Network,
+        /// <summary>The network check's report groups (rows that only show what was measured).</summary>
+        NetLink, NetLatency, NetSpeed, NetDns, NetPath, NetSystem,
+        /// <summary>The title over the fixes the network check offers.</summary>
+        NetFixes,
+    }
 
     /// <summary>
     /// One system setting DriveUP can change and put back exactly as it was. Values are short

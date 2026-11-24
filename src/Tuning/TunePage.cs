@@ -27,6 +27,24 @@ namespace DriveUp
         readonly List<ModeCard> cards = new List<ModeCard>();
         readonly ToolTip tip = new ToolTip();
 
+        // ---------- "Check network" ----------
+        readonly NetCard netCard = new NetCard();
+        readonly NetOffer offer = new NetOffer();
+        /// <summary>Two more minutes of quiet pinging (drops, Wi-Fi's periodic spikes).</summary>
+        readonly ToggleSwitch swLong = new ToggleSwitch("");
+        readonly FlatButton btnRecheck;
+        /// <summary>The right side shows the network report, not a mode's plan.</summary>
+        bool netView;
+        /// <summary>The check running or last run (this session); its report and fix rows stay while other views show.</summary>
+        NetCheck net;
+        bool netRunning, netWanted;
+        string netProgress = "";
+        List<TuneRow> netRows = new List<TuneRow>();
+        readonly Dictionary<NetFinding, TuneRow> netRowOf = new Dictionary<NetFinding, TuneRow>();
+        /// <summary>Rows waiting to come in: several results at once arrive one after another (a wave, one per few frames).</summary>
+        readonly Queue<TuneRow> netQueue = new Queue<TuneRow>();
+        bool netPumping;
+
         Machine machine;
         TuneMode selected, recommended;
         /// <summary>The mode the plan rows on screen were built for (Apply uses this one), and whether a plan is being read.</summary>
@@ -83,6 +101,23 @@ namespace DriveUp
             listCard.Resize += (s, e) => LayoutList();
             Controls.Add(listCard);
 
+            netCard.Click += (s, e) => { if (!working) ShowNet(true); };
+            netCard.Note = NetNote;
+            netCard.Issues = Settings.NetIssues;
+            Controls.Add(netCard);
+            btnRecheck = new FlatButton("", "\uE72C");
+            btnRecheck.SetBaseHeight(40);
+            btnRecheck.Visible = false;
+            btnRecheck.Click += (s, e) => StartNet();
+            listCard.Controls.Add(btnRecheck);
+            swLong.Checked = Settings.NetLong;
+            swLong.Visible = false;
+            swLong.CheckedChanged += (s, e) => { lock (Settings.Sync) Settings.NetLong = swLong.Checked; Settings.Save(); };
+            listCard.Controls.Add(swLong);
+            list.ActionClicked += row => { if (row.Finding != null && row.Finding.Id == "driver") Host.OpenTab(0); };
+            offer.Accepted += (s, e) => { if (!working) ShowNet(true); };
+            Controls.Add(offer);
+
             Resize += (s, e) => LayoutPage();
         }
 
@@ -97,17 +132,20 @@ namespace DriveUp
             int leftW = Math.Max(S(320), Math.Min(S(500), (int)(Width * 0.36)));
             int smartH = S(158);
             smartCard.SetBounds(pad, pad, leftW, smartH);
-            int gap = S(10);
-            int avail = Height - pad * 2 - smartH - S(14);
-            int cardH = Math.Max(S(84), Math.Min(S(118), (avail - gap * (cards.Count - 1)) / Math.Max(1, cards.Count)));
+            int gap = S(10), netH = S(72);
+            // The modes share what is left after the network card under them (they never get taller than 118).
+            int avail = Height - pad * 2 - smartH - S(14) - netH - gap;
+            int cardH = Math.Max(S(72), Math.Min(S(118), (avail - gap * (cards.Count - 1)) / Math.Max(1, cards.Count)));
             int y = smartCard.Bottom + S(14);
             foreach (var c in cards)
             {
                 c.SetBounds(pad, y, leftW, cardH);
                 y += cardH + gap;
             }
+            netCard.SetBounds(pad, y, leftW, netH);
             int x = pad + leftW + S(20);
             listCard.SetBounds(x, pad, Math.Max(S(300), Width - x - pad), Height - pad * 2);
+            offer.Place(OfferArea, OfferBottom);
             LayoutSmart();
             LayoutList();
         }
@@ -136,7 +174,13 @@ namespace DriveUp
                 b.Width = b.PreferredWidth + S(8);
                 b.Location = new Point(listCard.Width - b.Width - S(16), fy + (footH - b.Height) / 2);
             }
-            var right = btnApply.Visible ? btnApply : btnReturnAll;
+            if (btnRecheck.Visible)
+            {
+                btnRecheck.Width = btnRecheck.PreferredWidth + S(8);
+                btnRecheck.Location = new Point(btnApply.Left - btnRecheck.Width - S(8), btnApply.Top);
+            }
+            swLong.Location = new Point(listCard.Width - swLong.Width - S(14), Math.Max(0, (listCard.TitleHeight - swLong.Height) / 2));
+            var right = btnApply.Visible ? (btnRecheck.Visible ? btnRecheck : btnApply) : btnReturnAll;
             info.SetBounds(S(20), fy, Math.Max(S(60), right.Left - S(32)), footH);
             list.SetBounds(S(2), listCard.TitleHeight, listCard.Width - S(4), fy - listCard.TitleHeight);
             listCard.Invalidate();
@@ -162,6 +206,15 @@ namespace DriveUp
             tip.SetToolTip(btnSmart, L.T("DriveUP смотрит на компьютер — ноутбук или ПК, батарея, видеокарта, версия Windows —\nи выбирает режим и значения, которые ему подходят",
                 "DriveUP looks at the computer — laptop or desktop, battery, graphics card, Windows version —\nand picks the mode and values that suit it"));
             SetButton(btnReturnAll, L.T("Вернуть всё", "Return all"));
+            SetButton(btnRecheck, L.T("Проверить снова", "Check again"));
+            swLong.Text = L.T("Долгий замер", "Long check");
+            tip.SetToolTip(swLong, L.T("Ещё 2 минуты следить за задержкой: видны редкие обрывы и всплески,\nкоторые Wi-Fi даёт раз в 20–60 секунд при фоновом поиске сетей",
+                "Watch the delay for 2 more minutes: shows rare drops and the spikes\nWi-Fi makes every 20–60 seconds while scanning for networks"));
+            tip.SetToolTip(netCard, L.T("Задержка до роутера и до интернета, сигнал Wi-Fi, DNS, скорость под нагрузкой,\nIPv6 и сетевые настройки Windows — с понятными выводами и исправлениями.\nОптимизация режимов сеть не трогает.",
+                "Delay to the router and to the internet, Wi-Fi signal, DNS, speed under load,\nIPv6 and Windows network settings — with plain conclusions and fixes.\nThe tuning modes never touch the network."));
+            UpdateNetButtons();
+            netCard.Invalidate();
+            offer.Invalidate();
             list.EmptyGlyph = "\uE73E";
             UpdateViewTexts();
             UpdateSmart();
@@ -186,7 +239,7 @@ namespace DriveUp
             int n = Tuner.ChangedCount;
             view.SetTexts(new[]
             {
-                L.T("Что изменится", "What changes"),
+                netView ? L.T("Проверка сети", "Network check") : L.T("Что изменится", "What changes"),
                 L.T("Изменено", "Changed") + (n > 0 ? " · " + n : ""),
             });
             LayoutList();
@@ -208,6 +261,7 @@ namespace DriveUp
 
         void UpdateApplyText()
         {
+            btnApply.Glyph = "\uE73E";
             if (selected == null) SetButton(btnApply, L.T("Применить", "Apply"));
             else
             {
@@ -222,6 +276,14 @@ namespace DriveUp
 
         void UpdateEmpty()
         {
+            list.EmptyGlyph = netView && !showChanged ? "\uE701" : "\uE73E";
+            if (netView && !showChanged)
+            {
+                list.EmptyText = netRunning || netWanted ? "" : L.T("Около 30 секунд: задержка до роутера и интернета, Wi-Fi, DNS, скорость под нагрузкой и сетевые настройки.\nНичего не меняется, пока вы сами не отметите исправления.",
+                    "About 30 seconds: delay to the router and the internet, Wi-Fi, DNS, speed under load and network settings.\nNothing changes until you tick fixes yourself.");
+                list.Invalidate();
+                return;
+            }
             list.EmptyText = showChanged
                 ? L.T("Пока ничего не изменено.\nВыберите режим и нажмите «Применить» — здесь появится каждое изменение с кнопкой «Вернуть».",
                       "Nothing changed yet.\nPick a mode and click Apply — every change shows up here with its own Return button.")
@@ -231,6 +293,7 @@ namespace DriveUp
 
         void UpdateInfo()
         {
+            if (netView && !showChanged) { UpdateNetButtons(); return; }
             if (!loaded) { info.SetText(""); return; }
             var rows = list.Rows;
             if (showChanged)
@@ -263,6 +326,7 @@ namespace DriveUp
         {
             get
             {
+                if (netRunning) return L.T("Проверяю сеть…", "Checking the network…");
                 if (!loaded) return L.T("Смотрю настройки Windows…", "Reading Windows settings…");
                 var mode = Tuner.Mode(Settings.TuneMode);
                 int n = Tuner.ChangedCount;
@@ -324,12 +388,18 @@ namespace DriveUp
                     UpdateViewTexts();
                     UpdateEmpty();
                     if (!changedView) rowsMode = mode;
-                    if (first) list.SetRows(rows, true);
-                    else Transition.CrossFade(list, () => list.SetRows(rows, false), 200);
+                    // The network report stays on screen (the plan is still read, for when a mode is picked).
+                    bool report = netView && !changedView;
+                    if (!report)
+                    {
+                        if (first) list.SetRows(rows, true);
+                        else Transition.CrossFade(list, () => list.SetRows(rows, false), 200);
+                    }
                     UpdateInfo();
                     Host.UpdateStatus();
+                    if (netWanted && net == null) StartNet();
                     // Another mode was picked while this was being read: show that one.
-                    if (!changedView && selected != null && selected != mode) Select(selected, false, true);
+                    if (!changedView && !report && selected != null && selected != mode) Select(selected, false, true);
                 });
             }) { IsBackground = true, Name = "Tune read" }.Start();
         }
@@ -337,7 +407,7 @@ namespace DriveUp
         void SetSelected(TuneMode m)
         {
             selected = m;
-            foreach (var c in cards) c.Selected = c.Mode == m;
+            foreach (var c in cards) c.Selected = c.Mode == m && !netView;
             UpdateApplyText();
         }
 
@@ -345,8 +415,21 @@ namespace DriveUp
         void Select(TuneMode m, bool user, bool force = false)
         {
             if (m == null) return;
-            if (m == selected && m == rowsMode && !force && !showChanged) return;
+            if (m == selected && m == rowsMode && !force && !showChanged && !netView) return;
             int from = rowsMode != null ? Tuner.Modes.IndexOf(rowsMode) : 0, to = Tuner.Modes.IndexOf(m);
+            offer.Close();
+            if (netView)
+            {
+                // Back from the network report (its card sits under the modes: the plan comes from below).
+                netView = false;
+                netWanted = false;
+                netCard.Selected = false;
+                from = Tuner.Modes.Count;
+                swLong.Visible = false;
+                btnRecheck.Visible = false;
+                UpdateViewTexts();
+                LayoutList();
+            }
             SetSelected(m);
             if (showChanged)
             {
@@ -367,6 +450,8 @@ namespace DriveUp
                 {
                     if (seq != loadSeq) return;
                     planLoading = false;
+                    // The network report was opened meanwhile: it stays.
+                    if (netView) return;
                     rowsMode = m;
                     UpdateEmpty();
                     Transition.CrossFade(list, () => list.SetRows(rows, false), 240, Math.Sign(to - from) * S(28));
@@ -445,9 +530,15 @@ namespace DriveUp
             btnApply.Visible = !changed;
             btnReturnAll.Visible = changed;
             if (changed) btnReturnAll.Appear(); else btnApply.Appear();
+            swLong.Visible = netView && !changed;
+            UpdateNetButtons();
             LayoutList();
             UpdateEmpty();
-            if (loaded) Reload(false);
+            if (loaded)
+            {
+                if (!changed && netView) ShowNetRows(true);
+                else Reload(false);
+            }
         }
 
         // ---------- applying ----------
@@ -469,13 +560,24 @@ namespace DriveUp
             swMeasure.Enabled = !on;
             view.Enabled = !on;
             foreach (var c in cards) c.Enabled = !on;
-            if (on) { btnApply.Enabled = false; btnReturnAll.Enabled = false; }
+            netCard.Enabled = !on;
+            swLong.Enabled = !on;
+            btnRecheck.Enabled = !on;
+            if (on) { btnApply.Enabled = false; btnReturnAll.Enabled = false; offer.Close(); }
             if (on) Host.BeginBusy(); else Host.EndBusy();
         }
 
         void Apply()
         {
-            if (working || planLoading || rowsMode == null || showChanged) return;
+            if (working || showChanged) return;
+            if (netView)
+            {
+                // The same button stops a running check, starts one, checks again, or applies the ticked fixes.
+                if (netRunning) { net.Cancel = true; btnApply.Enabled = false; return; }
+                if (!list.Rows.Any(r => r.Actionable && r.Checked && r.Ready)) { StartNet(); return; }
+            }
+            else if (planLoading || rowsMode == null) return;
+            bool forNet = netView;
             var todo = list.Rows.Where(r => r.Actionable && r.Checked && r.Ready).ToList();
             if (todo.Count == 0) return;
             if (!Host.CanStartOperation()) return;
@@ -488,7 +590,7 @@ namespace DriveUp
                         "Each can be returned under Changed. Apply them along with the rest?"),
                     L.T("Применить", "Apply"), "\uE73E", true))
                 return;
-            var mode = rowsMode;
+            var mode = forNet ? NetFix.Mode : rowsMode;
             SetWorking(true);
             new Thread(() =>
             {
@@ -498,7 +600,7 @@ namespace DriveUp
                 // The "before" measurement, once, ahead of the first change — only when the user turned measuring on.
                 bool noBaseline;
                 lock (Settings.Sync) noBaseline = Settings.TuneMeasure && string.IsNullOrEmpty(Settings.TuneBaseline);
-                if (noBaseline && Tuner.ChangedCount == 0)
+                if (noBaseline && Tuner.ChangedCount == 0 && !forNet)
                 {
                     Post(() => info.SetText(L.T("Замеряю систему «до»…", "Measuring the system \"before\"…")));
                     try
@@ -554,7 +656,8 @@ namespace DriveUp
                             Post(() => list.SetState(r, TuneState.Failed, msg));
                         }
                     }
-                if (done > 0) Tuner.SetMode(mode.Id);
+                RestartAdapters();
+                if (done > 0 && !forNet) Tuner.SetMode(mode.Id);
                 Journal.Add(JournalKind.Tune, done, failed, mode.Name() + ": " + string.Join(", ", names));
                 Thread.Sleep(250);
                 Post(() => Applied(mode, done, failed, reboot));
@@ -564,6 +667,18 @@ namespace DriveUp
         void Applied(TuneMode mode, int done, int failed, bool reboot)
         {
             SetWorking(false);
+            if (mode == NetFix.Mode)
+            {
+                UpdateViewTexts();
+                UpdateInfo();
+                Host.UpdateStatus();
+                if (failed == 0)
+                    Host.ShowToast(L.T("Исправлено: ", "Fixed: ") + done + L.T(". Проверьте сеть снова — увидите разницу", ". Check the network again to see the difference"), ToastKind.Success);
+                else
+                    Host.ShowToast(L.T("Не удалось исправить: ", "Could not fix: ") + failed + L.T(" — причина в списке", " — see the list for why"), ToastKind.Error);
+                if (reboot) AskRestart();
+                return;
+            }
             foreach (var c in cards) c.Active = c.Mode.Id == Settings.TuneMode && Tuner.ChangedCount > 0;
             UpdateViewTexts();
             UpdateInfo();
@@ -572,6 +687,11 @@ namespace DriveUp
                 Host.ShowToast(L.T("Режим «", "") + mode.Name() + L.T("» включён. Что изменено — во вкладке «Изменено»", " mode is on. See what changed under Changed"), ToastKind.Success);
             else
                 Host.ShowToast(L.T("Не удалось изменить: ", "Could not change: ") + failed + L.T(" — причина в списке", " — see the list for why"), ToastKind.Error);
+            // After a mode, a quiet offer to check the network too (not when it was checked within a day).
+            DateTime last;
+            lock (Settings.Sync) last = Settings.NetChecked;
+            if (failed == 0 && done > 0 && !netRunning && (DateTime.Now - last).TotalHours > 24)
+                Anim.Delay(1600, () => { if (!IsDisposed && !working && !netView && Visible) offer.Open(OfferArea, OfferBottom); });
             // Show what was changed, each with its Return button (failures stay in view to be read).
             if (failed == 0 && done > 0)
                 Anim.Delay(900, () =>
@@ -628,6 +748,7 @@ namespace DriveUp
                         Post(() => list.SetState(r, TuneState.Failed, msg));
                     }
                 }
+                RestartAdapters();
                 Journal.Add(JournalKind.TuneReturn, done, failed, string.Join(", ", names));
                 Thread.Sleep(300);
                 Post(() =>
@@ -646,6 +767,265 @@ namespace DriveUp
                         Host.ShowToast(L.T("Часть настроек вернётся после перезагрузки", "Some settings go back after a restart"), ToastKind.Info);
                 });
             }) { IsBackground = true, Name = "Tune return" }.Start();
+        }
+    
+        // ---------- "Check network" ----------
+
+        /// <summary>Where the offer slides up: across the list, just above its footer.</summary>
+        Rectangle OfferArea { get { return new Rectangle(listCard.Left + S(20), 0, Math.Max(S(200), listCard.Width - S(40)), 0); } }
+        int OfferBottom { get { return listCard.Bottom - S(64) - S(10); } }
+
+        /// <summary>The network card's second line: what it checks, how far it is, or how the last check went.</summary>
+        string NetNote()
+        {
+            if (netRunning) return netProgress.Length > 0 ? netProgress : L.T("Проверяю…", "Checking…");
+            DateTime when;
+            int issues;
+            lock (Settings.Sync) { when = Settings.NetChecked; issues = Settings.NetIssues; }
+            if (when == DateTime.MinValue) return L.T("Задержка, Wi-Fi, DNS, скорость", "Delay, Wi-Fi, DNS, speed");
+            return L.T("Проверено ", "Checked ") + L.When(when) + (issues == 0 ? L.T(" · всё в порядке", " · all fine") : "");
+        }
+
+        /// <summary>Opens the network report (from the card or the offer); starts a check if none ran yet.</summary>
+        void ShowNet(bool start)
+        {
+            if (working) return;
+            offer.Close();
+            // About to start: no "press start" text flashing in the list meanwhile.
+            if (start && net == null) netWanted = true;
+            if (!netView)
+            {
+                netView = true;
+                planLoading = false;
+                foreach (var c in cards) c.Selected = false;
+                netCard.Selected = true;
+                UpdateViewTexts();
+                if (showChanged) view.SelectedIndex = 0;   // ShowView brings the report in
+                else
+                {
+                    swLong.Visible = true;
+                    UpdateEmpty();
+                    ShowNetRows(true);
+                }
+            }
+            if (start && !netRunning && net == null) StartNet();
+            UpdateNetButtons();
+        }
+
+        void ShowNetRows(bool slide)
+        {
+            netQueue.Clear();
+            var rows = netRows.ToList();
+            Transition.CrossFade(list, () => list.SetRows(rows, false), 240, slide ? S(28) : 0);
+            UpdateEmpty();
+            UpdateNetButtons();
+        }
+
+        /// <summary>A row at the end of its group in the kept report (a new group gets its title first).</summary>
+        static void InsertGrouped(List<TuneRow> rows, TuneRow row)
+        {
+            int at = rows.FindLastIndex(r => r.Category == row.Category);
+            if (at < 0)
+            {
+                rows.Add(new TuneRow { Kind = TuneKind.Header, Category = row.Category, Checked = false });
+                at = rows.Count - 1;
+            }
+            rows.Insert(at + 1, row);
+        }
+
+        /// <summary>Runs the check in the background: each result appears as it is measured.</summary>
+        void StartNet()
+        {
+            if (netRunning || working) return;
+            // The computer is still being read: the check starts as soon as it is.
+            if (machine == null) { netWanted = true; return; }
+            netWanted = false;
+            offer.Close();
+            if (!netView) ShowNet(false);
+            var check = new NetCheck(machine) { Long = Settings.NetLong };
+            net = check;
+            netRows = new List<TuneRow>();
+            netRowOf.Clear();
+            netQueue.Clear();
+            netRunning = true;
+            netProgress = "";
+            netCard.Busy = true;
+            Host.BeginBusy();
+            Host.UpdateStatus();
+            if (netView && !showChanged)
+            {
+                if (list.Rows.Count > 0) Transition.CrossFade(list, () => list.SetRows(new List<TuneRow>(), false), 200);
+                else list.SetRows(new List<TuneRow>(), false);
+            }
+            UpdateEmpty();
+            UpdateNetButtons();
+            check.Added = f => Post(() => NetAdded(check, f));
+            check.Updated = f => Post(() => NetUpdated(check, f));
+            check.Progress = t => Post(() =>
+            {
+                if (check != net) return;
+                netProgress = t;
+                netCard.Invalidate();
+                UpdateNetButtons();
+            });
+            new Thread(() =>
+            {
+                List<TuneRow> fixes = null;
+                try { check.Run(); }
+                catch (Exception ex) { Journal.Add(JournalKind.Tune, 0, 1, L.T("Проверка сети: ", "Network check: ") + ex.Message); }
+                if (!check.Cancel)
+                    try
+                    {
+                        if (Tuner.Pc == null) Tuner.Pc = check.Pc;
+                        using (AllUsers.Mount()) fixes = Tuner.RowsFor(NetFix.Steps(check));
+                    }
+                    catch { }
+                Post(() => NetDone(check, fixes));
+            }) { IsBackground = true, Name = "Net check" }.Start();
+        }
+
+        void NetAdded(NetCheck check, NetFinding f)
+        {
+            if (check != net) return;
+            // Always measuring at first: the result that follows draws its mark in.
+            var row = new TuneRow { Kind = TuneKind.Info, Category = f.Group, Finding = f, Checked = false, State = TuneState.Working };
+            netRowOf[f] = row;
+            InsertGrouped(netRows, row);
+            if (netView && !showChanged)
+            {
+                netQueue.Enqueue(row);
+                PumpNet();
+            }
+        }
+
+        void PumpNet()
+        {
+            if (netPumping) return;
+            if (netQueue.Count == 0 || IsDisposed) return;
+            var row = netQueue.Dequeue();
+            if (netView && !showChanged && netRows.Contains(row) && !list.Rows.Contains(row))
+            {
+                list.Append(row);
+                // Its result came while it waited: the mark draws in once the row is there.
+                if (row.Finding.Level != NetLevel.Pending) Anim.Delay(140, () => list.Refresh(row));
+            }
+            netPumping = true;
+            Anim.Delay(55, () => { netPumping = false; PumpNet(); });
+        }
+
+        void NetUpdated(NetCheck check, NetFinding f)
+        {
+            if (check != net) return;
+            TuneRow row;
+            if (!netRowOf.TryGetValue(f, out row)) return;
+            if (netView && !showChanged && list.Rows.Contains(row)) list.Refresh(row);
+            else if (netQueue.Contains(row)) { }   // refreshed when it comes in
+            else if (f.Level != NetLevel.Pending) row.State = TuneState.Done;
+        }
+
+        void NetDone(NetCheck check, List<TuneRow> fixes)
+        {
+            if (check != net) return;
+            netRunning = false;
+            netCard.Busy = false;
+            Host.EndBusy();
+            // Stopped: whatever was still being measured says so.
+            foreach (var f in check.Findings.ToList())
+                if (f.Level == NetLevel.Pending)
+                {
+                    f.Level = NetLevel.Info;
+                    f.Value = () => L.T("не измерено — проверка остановлена", "not measured — the check was stopped");
+                    f.Detail = () => "";
+                    NetUpdated(check, f);
+                }
+            int issues = check.Findings.Count(f => f.Problem);
+            var change = (fixes ?? new List<TuneRow>()).Where(r => r.Kind == TuneKind.Change).ToList();
+            if (change.Count > 0)
+            {
+                var head = new TuneRow { Kind = TuneKind.Header, Category = TuneCat.NetFixes, Checked = false };
+                netRows.Add(head);
+                netRows.AddRange(change);
+                if (netView && !showChanged)
+                {
+                    // After the report rows still coming in, then one by one.
+                    int wait = 55 * (netQueue.Count + 1);
+                    Anim.Delay(wait, () => { if (net == check && !list.Rows.Contains(head) && netView && !showChanged) list.AppendRow(head); });
+                    for (int i = 0; i < change.Count; i++)
+                    {
+                        var r = change[i];
+                        Anim.Delay(wait + 70 * (i + 1), () => { if (net == check && list.Rows.Contains(head) && !list.Rows.Contains(r) && netView && !showChanged) list.AppendRow(r); });
+                    }
+                    // The fixes are what to look at now.
+                    Anim.Delay(wait + 70 * change.Count + 120, () => { if (net == check && list.Rows.Contains(head)) list.ScrollToRow(head); });
+                }
+            }
+            if (!check.Cancel)
+            {
+                lock (Settings.Sync)
+                {
+                    Settings.NetChecked = DateTime.Now;
+                    Settings.NetIssues = issues;
+                }
+                Settings.Save();
+                netCard.Issues = issues;
+                Host.ShowToast(issues == 0
+                    ? L.T("Сеть в порядке — проблем не найдено", "The network is fine — no problems found")
+                    : L.T("Проверка сети: ", "Network check: ") + L.Count(issues, "замечание", "замечания", "замечаний", "issue", "issues") +
+                      (change.Count > 0 ? L.T(", исправить можно: ", ", fixable: ") + change.Count : L.T(", советы — в строках", ", advice is in the rows")),
+                    issues == 0 ? ToastKind.Success : ToastKind.Info);
+            }
+            netCard.Invalidate();
+            Host.UpdateStatus();
+            UpdateEmpty();
+            UpdateNetButtons();
+            Anim.Delay(55 * (netQueue.Count + 1) + 70 * change.Count + 40, UpdateNetButtons);
+        }
+
+        /// <summary>The footer while the report shows: the one button stops, starts, fixes or checks again; the line says where it is.</summary>
+        void UpdateNetButtons()
+        {
+            if (!netView || showChanged)
+            {
+                if (btnRecheck.Visible) { btnRecheck.Visible = false; LayoutList(); }
+                return;
+            }
+            var rows = list.Rows;
+            int ready = rows.Count(r => r.Actionable && r.Ready);
+            int ticked = rows.Count(r => r.Actionable && r.Checked && r.Ready);
+            string text;
+            if (netRunning) { text = L.T("Остановить", "Stop"); btnApply.Glyph = "\uE71A"; }
+            else if (net == null) { text = L.T("Начать проверку", "Start the check"); btnApply.Glyph = "\uE768"; }
+            else if (ready > 0) { text = L.T("Исправить", "Fix") + (ticked > 0 ? " · " + ticked : ""); btnApply.Glyph = "\uE90F"; }
+            else { text = L.T("Проверить снова", "Check again"); btnApply.Glyph = "\uE72C"; }
+            if (btnApply.Text != text) SetButton(btnApply, text);
+            btnApply.Enabled = !working && (netRunning ? !net.Cancel : (ready == 0 || ticked > 0));
+            bool recheck = !netRunning && net != null && ready > 0;
+            if (btnRecheck.Visible != recheck)
+            {
+                btnRecheck.Visible = recheck;
+                if (recheck) btnRecheck.Appear();
+            }
+            string t;
+            if (netRunning) t = netProgress;
+            else if (net == null) t = "";
+            else
+            {
+                int issues = net.Findings.Count(f => f.Problem);
+                t = (net.Cancel ? L.T("Проверка остановлена · ", "Check stopped · ") : "") +
+                    (issues == 0 ? L.T("Проблем не найдено", "No problems found") : L.Count(issues, "замечание", "замечания", "замечаний", "issue", "issues")) +
+                    (ready > 0 ? L.T(" · исправить можно: ", " · can be fixed: ") + ready : issues > 0 ? L.T(" · что делать — в строках", " · what to do is in the rows") : "");
+            }
+            info.SetText(t);
+            LayoutList();
+        }
+
+        /// <summary>Adapters whose driver settings changed are restarted once, after all the changes (worker thread).</summary>
+        void RestartAdapters()
+        {
+            if (!NicRestart.Pending) return;
+            Post(() => info.SetText(L.T("Перезапускаю сетевую карту — связь пропадёт на несколько секунд…", "Restarting the network card — the connection drops for a few seconds…")));
+            if (NicRestart.Flush().Count > 0)
+                Post(() => Host.ShowToast(L.T("Сетевую карту не удалось перезапустить — изменения заработают после перезагрузки", "Could not restart the network card — the changes apply after a restart"), ToastKind.Info));
         }
     }
 }
